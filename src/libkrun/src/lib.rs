@@ -109,6 +109,15 @@ fn init_virtual_entry() -> VirtualDirEntry {
 static KRUNFW: LazyLock<Option<libloading::Library>> =
     LazyLock::new(|| unsafe { libloading::Library::new(KRUNFW_NAME).ok() });
 
+fn kernel_cmdline_prolog(kernel_cmdline_append: &str) -> String {
+    let kernel_cmdline_append = kernel_cmdline_append.trim();
+    if kernel_cmdline_append.is_empty() {
+        format!("{DEFAULT_KERNEL_CMDLINE} init={INIT_PATH}")
+    } else {
+        format!("{DEFAULT_KERNEL_CMDLINE} init={INIT_PATH} {kernel_cmdline_append}")
+    }
+}
+
 pub struct KrunfwBindings {
     get_kernel: libloading::Symbol<
         'static,
@@ -183,6 +192,7 @@ struct ContextConfig {
     vmm_uid: Option<libc::uid_t>,
     vmm_gid: Option<libc::gid_t>,
     profile_path: Option<PathBuf>,
+    kernel_cmdline_append: Option<String>,
     #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
     disable_implicit_init: bool,
 }
@@ -355,6 +365,14 @@ impl ContextConfig {
 
     fn set_profile_path(&mut self, profile_path: PathBuf) {
         self.profile_path = Some(profile_path);
+    }
+
+    fn set_kernel_cmdline_append(&mut self, fragment: String) {
+        self.kernel_cmdline_append = Some(fragment);
+    }
+
+    fn get_kernel_cmdline_append(&self) -> &str {
+        self.kernel_cmdline_append.as_deref().unwrap_or("")
     }
 }
 
@@ -554,6 +572,31 @@ pub unsafe extern "C" fn krun_set_profile_path(ctx_id: u32, c_profile_path: *con
     match CTX_MAP.lock().unwrap().entry(ctx_id) {
         Entry::Occupied(mut ctx_cfg) => {
             ctx_cfg.get_mut().set_profile_path(profile_path);
+            KRUN_SUCCESS
+        }
+        Entry::Vacant(_) => -libc::ENOENT,
+    }
+}
+
+#[allow(clippy::missing_safety_doc)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn krun_set_kernel_cmdline_append(
+    ctx_id: u32,
+    c_fragment: *const c_char,
+) -> i32 {
+    if c_fragment.is_null() {
+        return -libc::EINVAL;
+    }
+
+    let fragment = match unsafe { CStr::from_ptr(c_fragment).to_str() } {
+        Ok(fragment) if !fragment.trim().is_empty() => fragment.trim().to_owned(),
+        Ok(_) => return -libc::EINVAL,
+        Err(_) => return -libc::EINVAL,
+    };
+
+    match CTX_MAP.lock().unwrap().entry(ctx_id) {
+        Entry::Occupied(mut ctx_cfg) => {
+            ctx_cfg.get_mut().set_kernel_cmdline_append(fragment);
             KRUN_SUCCESS
         }
         Entry::Vacant(_) => -libc::ENOENT,
@@ -3027,7 +3070,7 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
     }
 
     let kernel_cmdline = KernelCmdlineConfig {
-        prolog: Some(format!("{DEFAULT_KERNEL_CMDLINE} init={INIT_PATH}")),
+        prolog: Some(kernel_cmdline_prolog(ctx_cfg.get_kernel_cmdline_append())),
         krun_env: Some(format!(
             " {} {} {} {} {}",
             ctx_cfg.get_exec_path(),
@@ -3199,6 +3242,23 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
                 return -libc::EINVAL;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn kernel_cmdline_append_extends_default_prolog() {
+        assert_eq!(
+            kernel_cmdline_prolog(""),
+            format!("{DEFAULT_KERNEL_CMDLINE} init={INIT_PATH}")
+        );
+        assert_eq!(
+            kernel_cmdline_prolog(" loglevel=7 printk.time=1 "),
+            format!("{DEFAULT_KERNEL_CMDLINE} init={INIT_PATH} loglevel=7 printk.time=1")
+        );
     }
 }
 

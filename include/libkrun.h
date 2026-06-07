@@ -1289,6 +1289,18 @@ int32_t krun_disable_implicit_vsock(uint32_t ctx_id);
 int32_t krun_set_kernel_console(uint32_t ctx_id, const char *console_id);
 
 /*
+ * Append extra tokens to the generated kernel commandline.
+ *
+ * Arguments:
+ *  "ctx_id" - the configuration context ID.
+ *  "fragment" - space-separated kernel commandline tokens.
+ *
+ * Returns
+ *  Zero on success or a negative error number on failure.
+ */
+int32_t krun_set_kernel_cmdline_append(uint32_t ctx_id, const char *fragment);
+
+/*
  * Adds a virtio-console device to the guest.
  *
  * The function can be called multiple times for adding multiple virtio-console devices.

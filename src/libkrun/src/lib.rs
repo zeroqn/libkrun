@@ -190,6 +190,7 @@ struct ContextConfig {
     console_output: Option<PathBuf>,
     vmm_uid: Option<libc::uid_t>,
     vmm_gid: Option<libc::gid_t>,
+    profile_path: Option<PathBuf>,
     #[cfg(all(
         feature = "init-blob",
         not(any(feature = "tee", feature = "aws-nitro"))
@@ -361,6 +362,10 @@ impl ContextConfig {
 
     fn set_vmm_gid(&mut self, vmm_gid: libc::gid_t) {
         self.vmm_gid = Some(vmm_gid);
+    }
+
+    fn set_profile_path(&mut self, profile_path: PathBuf) {
+        self.profile_path = Some(profile_path);
     }
 }
 
@@ -540,6 +545,28 @@ pub unsafe extern "C" fn krun_init_log(target: RawFd, level: u32, style: u32, op
     builder.format_timestamp_micros().target(target).init();
 
     KRUN_SUCCESS
+}
+
+#[allow(clippy::missing_safety_doc)]
+#[no_mangle]
+pub unsafe extern "C" fn krun_set_profile_path(ctx_id: u32, c_profile_path: *const c_char) -> i32 {
+    if c_profile_path.is_null() {
+        return -libc::EINVAL;
+    }
+
+    let profile_path = match unsafe { CStr::from_ptr(c_profile_path).to_str() } {
+        Ok(path) if !path.is_empty() => PathBuf::from(path),
+        Ok(_) => return -libc::EINVAL,
+        Err(_) => return -libc::EINVAL,
+    };
+
+    match CTX_MAP.lock().unwrap().entry(ctx_id) {
+        Entry::Occupied(mut ctx_cfg) => {
+            ctx_cfg.get_mut().set_profile_path(profile_path);
+            KRUN_SUCCESS
+        }
+        Entry::Vacant(_) => -libc::ENOENT,
+    }
 }
 
 #[no_mangle]
@@ -2865,7 +2892,18 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
     #[cfg(feature = "aws-nitro")]
     return krun_start_enter_nitro(ctx_id);
 
-    let mut event_manager = match EventManager::new() {
+    let profile_path = CTX_MAP
+        .lock()
+        .unwrap()
+        .get(&ctx_id)
+        .and_then(|ctx_cfg| ctx_cfg.profile_path.clone());
+    let profiler = vmm::profile::KrunProfiler::start(profile_path);
+
+    let mut event_manager = match measure_libkrun_phase(
+        profiler.as_ref(),
+        "libkrun_start_enter_event_manager_create",
+        EventManager::new,
+    ) {
         Ok(em) => em,
         Err(e) => {
             error!("Unable to create EventManager: {e:?}");
@@ -2873,7 +2911,11 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
         }
     };
 
-    let mut ctx_cfg = match CTX_MAP.lock().unwrap().remove(&ctx_id) {
+    let mut ctx_cfg = match measure_libkrun_phase(
+        profiler.as_ref(),
+        "libkrun_start_enter_context_take",
+        || CTX_MAP.lock().unwrap().remove(&ctx_id),
+    ) {
         Some(ctx_cfg) => ctx_cfg,
         None => return -libc::ENOENT,
     };
@@ -2884,7 +2926,11 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
         && cfg!(not(feature = "efi"))
     {
         if let Some(ref krunfw) = ctx_cfg.krunfw {
-            if let Err(err) = unsafe { load_krunfw_payload(krunfw, &mut ctx_cfg.vmr) } {
+            if let Err(err) = measure_libkrun_phase(
+                profiler.as_ref(),
+                "libkrun_start_enter_load_firmware",
+                || unsafe { load_krunfw_payload(krunfw, &mut ctx_cfg.vmr) },
+            ) {
                 eprintln!("Can't load libkrunfw symbols: {err}");
                 return -libc::ENOENT;
             }
@@ -2895,8 +2941,20 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
     }
 
     #[cfg(feature = "blk")]
-    for block_cfg in ctx_cfg.get_block_cfg() {
-        if ctx_cfg.vmr.add_block_device(block_cfg).is_err() {
+    {
+        let block_result = measure_libkrun_phase(
+            profiler.as_ref(),
+            "libkrun_start_enter_configure_block",
+            || {
+                for block_cfg in ctx_cfg.get_block_cfg() {
+                    if ctx_cfg.vmr.add_block_device(block_cfg).is_err() {
+                        return Err(());
+                    }
+                }
+                Ok(())
+            },
+        );
+        if block_result.is_err() {
             error!("Error configuring virtio-blk for block");
             return -libc::EINVAL;
         }
@@ -2932,93 +2990,126 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
         epilog: Some(format!(" -- {}", ctx_cfg.get_args())),
     };
 
-    if ctx_cfg.vmr.set_kernel_cmdline(kernel_cmdline).is_err() {
+    if measure_libkrun_phase(
+        profiler.as_ref(),
+        "libkrun_start_enter_configure_kernel_cmdline",
+        || ctx_cfg.vmr.set_kernel_cmdline(kernel_cmdline),
+    )
+    .is_err()
+    {
         return -libc::EINVAL;
     }
 
     #[cfg(feature = "net")]
-    {
-        if let Some(legacy_net_cfg) = ctx_cfg.legacy_net_cfg.clone() {
-            let backend = match legacy_net_cfg {
-                LegacyNetworkConfig::VirtioNetGvproxy(path) => {
-                    VirtioNetBackend::UnixgramPath(path, true)
-                }
-                LegacyNetworkConfig::VirtioNetPasst(fd) => VirtioNetBackend::UnixstreamFd(fd),
-            };
-            let mac = ctx_cfg
-                .legacy_mac
-                .unwrap_or([0x5a, 0x94, 0xef, 0xe4, 0x0c, 0xee]);
-            create_virtio_net(&mut ctx_cfg, backend, mac, NET_COMPAT_FEATURES);
-        }
-    }
-
-    match &ctx_cfg.vsock_config {
-        VsockConfig::Disabled => (),
-        VsockConfig::Explicit { tsi_flags } => {
-            let vsock_device_config = VsockDeviceConfig {
-                vsock_id: "vsock0".to_string(),
-                guest_cid: 3,
-                host_port_map: ctx_cfg.tsi_port_map,
-                unix_ipc_port_map: ctx_cfg.unix_ipc_port_map.clone(),
-                tsi_flags: *tsi_flags,
-            };
-            ctx_cfg.vmr.set_vsock_device(vsock_device_config).unwrap();
-        }
-        VsockConfig::Implicit => {
-            // Implicit vsock configuration - use heuristics
-            // Check if TSI should be enabled based on network configuration
-            #[cfg(feature = "net")]
-            let enable_tsi = ctx_cfg.vmr.net.list.is_empty() && ctx_cfg.legacy_net_cfg.is_none();
-            #[cfg(not(feature = "net"))]
-            let enable_tsi = true;
-
-            let has_ipc_map = ctx_cfg.unix_ipc_port_map.is_some();
-
-            if enable_tsi || has_ipc_map {
-                let (tsi_flags, host_port_map) = if enable_tsi {
-                    (TsiFlags::HIJACK_INET, ctx_cfg.tsi_port_map)
-                } else {
-                    (TsiFlags::empty(), None)
+    measure_libkrun_phase(
+        profiler.as_ref(),
+        "libkrun_start_enter_configure_net",
+        || {
+            if let Some(legacy_net_cfg) = ctx_cfg.legacy_net_cfg.clone() {
+                let backend = match legacy_net_cfg {
+                    LegacyNetworkConfig::VirtioNetGvproxy(path) => {
+                        VirtioNetBackend::UnixgramPath(path, true)
+                    }
+                    LegacyNetworkConfig::VirtioNetPasst(fd) => VirtioNetBackend::UnixstreamFd(fd),
                 };
-
-                let vsock_device_config = VsockDeviceConfig {
-                    vsock_id: "vsock0".to_string(),
-                    guest_cid: 3,
-                    host_port_map,
-                    unix_ipc_port_map: ctx_cfg.unix_ipc_port_map.clone(),
-                    tsi_flags,
-                };
-                ctx_cfg.vmr.set_vsock_device(vsock_device_config).unwrap();
+                let mac = ctx_cfg
+                    .legacy_mac
+                    .unwrap_or([0x5a, 0x94, 0xef, 0xe4, 0x0c, 0xee]);
+                create_virtio_net(&mut ctx_cfg, backend, mac, NET_COMPAT_FEATURES);
             }
-        }
-    }
+        },
+    );
 
-    if let Some(virgl_flags) = ctx_cfg.gpu_virgl_flags {
-        ctx_cfg.vmr.set_gpu_virgl_flags(virgl_flags);
-    }
-    if let Some(shm_size) = ctx_cfg.gpu_shm_size {
-        ctx_cfg.vmr.set_gpu_shm_size(shm_size);
-    }
+    measure_libkrun_phase(
+        profiler.as_ref(),
+        "libkrun_start_enter_configure_vsock",
+        || {
+            match &ctx_cfg.vsock_config {
+                VsockConfig::Disabled => (),
+                VsockConfig::Explicit { tsi_flags } => {
+                    let vsock_device_config = VsockDeviceConfig {
+                        vsock_id: "vsock0".to_string(),
+                        guest_cid: 3,
+                        host_port_map: ctx_cfg.tsi_port_map,
+                        unix_ipc_port_map: ctx_cfg.unix_ipc_port_map.clone(),
+                        tsi_flags: *tsi_flags,
+                    };
+                    ctx_cfg.vmr.set_vsock_device(vsock_device_config).unwrap();
+                }
+                VsockConfig::Implicit => {
+                    // Implicit vsock configuration - use heuristics
+                    // Check if TSI should be enabled based on network configuration
+                    #[cfg(feature = "net")]
+                    let enable_tsi =
+                        ctx_cfg.vmr.net.list.is_empty() && ctx_cfg.legacy_net_cfg.is_none();
+                    #[cfg(not(feature = "net"))]
+                    let enable_tsi = true;
 
-    #[cfg(feature = "snd")]
-    ctx_cfg.vmr.set_snd_device(ctx_cfg.enable_snd);
+                    let has_ipc_map = ctx_cfg.unix_ipc_port_map.is_some();
 
-    if let Some(console_output) = ctx_cfg.console_output {
-        ctx_cfg.vmr.set_console_output(console_output);
-    }
+                    if enable_tsi || has_ipc_map {
+                        let (tsi_flags, host_port_map) = if enable_tsi {
+                            (TsiFlags::HIJACK_INET, ctx_cfg.tsi_port_map)
+                        } else {
+                            (TsiFlags::empty(), None)
+                        };
 
-    if let Some(gid) = ctx_cfg.vmm_gid {
-        if unsafe { libc::setgid(gid) } != 0 {
-            error!("Failed to set gid {gid}");
-            return -std::io::Error::last_os_error().raw_os_error().unwrap();
-        }
-    }
+                        let vsock_device_config = VsockDeviceConfig {
+                            vsock_id: "vsock0".to_string(),
+                            guest_cid: 3,
+                            host_port_map,
+                            unix_ipc_port_map: ctx_cfg.unix_ipc_port_map.clone(),
+                            tsi_flags,
+                        };
+                        ctx_cfg.vmr.set_vsock_device(vsock_device_config).unwrap();
+                    }
+                }
+            }
+        },
+    );
 
-    if let Some(uid) = ctx_cfg.vmm_uid {
-        if unsafe { libc::setuid(uid) } != 0 {
-            error!("Failed to set uid {uid}");
-            return -std::io::Error::last_os_error().raw_os_error().unwrap();
-        }
+    measure_libkrun_phase(
+        profiler.as_ref(),
+        "libkrun_start_enter_configure_gpu_console",
+        || {
+            if let Some(virgl_flags) = ctx_cfg.gpu_virgl_flags {
+                ctx_cfg.vmr.set_gpu_virgl_flags(virgl_flags);
+            }
+            if let Some(shm_size) = ctx_cfg.gpu_shm_size {
+                ctx_cfg.vmr.set_gpu_shm_size(shm_size);
+            }
+
+            #[cfg(feature = "snd")]
+            ctx_cfg.vmr.set_snd_device(ctx_cfg.enable_snd);
+
+            if let Some(console_output) = ctx_cfg.console_output {
+                ctx_cfg.vmr.set_console_output(console_output);
+            }
+        },
+    );
+
+    let set_identity_result = measure_libkrun_phase(
+        profiler.as_ref(),
+        "libkrun_start_enter_set_identity",
+        || {
+            if let Some(gid) = ctx_cfg.vmm_gid {
+                if unsafe { libc::setgid(gid) } != 0 {
+                    error!("Failed to set gid {gid}");
+                    return -std::io::Error::last_os_error().raw_os_error().unwrap();
+                }
+            }
+
+            if let Some(uid) = ctx_cfg.vmm_uid {
+                if unsafe { libc::setuid(uid) } != 0 {
+                    error!("Failed to set uid {uid}");
+                    return -std::io::Error::last_os_error().raw_os_error().unwrap();
+                }
+            }
+            KRUN_SUCCESS
+        },
+    );
+    if set_identity_result != KRUN_SUCCESS {
+        return set_identity_result;
     }
 
     let (sender, _receiver) = unbounded();
@@ -3028,6 +3119,7 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
         &mut event_manager,
         ctx_cfg.shutdown_efd,
         sender,
+        profiler.as_ref(),
     ) {
         Ok(vmm) => vmm,
         Err(e) => {
@@ -3049,6 +3141,10 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
     #[cfg(any(feature = "amd-sev", feature = "tdx"))]
     vmm::worker::start_worker_thread(_vmm.clone(), _receiver.clone()).unwrap();
 
+    if let Some(profiler) = profiler.as_ref() {
+        profiler.record_marker("libkrun_start_enter_event_loop_runtime");
+    }
+
     loop {
         match event_manager.run() {
             Ok(_) => {}
@@ -3057,6 +3153,17 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
                 return -libc::EINVAL;
             }
         }
+    }
+}
+
+fn measure_libkrun_phase<T>(
+    profiler: Option<&vmm::profile::KrunProfiler>,
+    label: &'static str,
+    f: impl FnOnce() -> T,
+) -> T {
+    match profiler {
+        Some(profiler) => profiler.measure(label, f),
+        None => f(),
     }
 }
 

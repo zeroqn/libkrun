@@ -19,6 +19,7 @@ use std::sync::atomic::AtomicI32;
 use std::sync::{Arc, Mutex};
 
 use super::{Error, Vmm};
+use crate::profile::KrunProfiler;
 
 #[cfg(target_arch = "x86_64")]
 use crate::device_manager::legacy::PortIODeviceManager;
@@ -565,16 +566,25 @@ pub fn build_microvm(
     event_manager: &mut EventManager,
     _shutdown_efd: Option<EventFd>,
     _sender: Sender<WorkerMessage>,
+    profiler: Option<&KrunProfiler>,
 ) -> std::result::Result<Arc<Mutex<Vmm>>, StartMicrovmError> {
-    let payload = choose_payload(vm_resources)?;
+    let payload = measure_builder_phase(profiler, "libkrun_build_microvm_choose_payload", || {
+        choose_payload(vm_resources)
+    })?;
 
-    let (guest_memory, arch_memory_info, mut _shm_manager, payload_config) = create_guest_memory(
-        vm_resources
-            .vm_config()
-            .mem_size_mib
-            .ok_or(StartMicrovmError::MissingMemSizeConfig)?,
-        vm_resources,
-        &payload,
+    let (guest_memory, arch_memory_info, mut _shm_manager, payload_config) = measure_builder_phase(
+        profiler,
+        "libkrun_build_microvm_create_guest_memory",
+        || {
+            create_guest_memory(
+                vm_resources
+                    .vm_config()
+                    .mem_size_mib
+                    .ok_or(StartMicrovmError::MissingMemSizeConfig)?,
+                vm_resources,
+                &payload,
+            )
+        },
     )?;
 
     let vcpu_config = vm_resources.vcpu_config();
@@ -1137,18 +1147,36 @@ pub fn build_microvm(
         println!("Starting TEE/microVM.");
     }
 
-    vmm.start_vcpus(vcpus)
-        .map_err(StartMicrovmError::Internal)?;
+    measure_builder_phase(profiler, "libkrun_build_microvm_start_vcpus", || {
+        vmm.start_vcpus(vcpus).map_err(StartMicrovmError::Internal)
+    })?;
 
     // Clippy thinks we don't need Arc<Mutex<...
     // but we don't want to change the event_manager interface
     #[allow(clippy::arc_with_non_send_sync)]
     let vmm = Arc::new(Mutex::new(vmm));
-    event_manager
-        .add_subscriber(vmm.clone())
-        .map_err(StartMicrovmError::RegisterEvent)?;
+    measure_builder_phase(
+        profiler,
+        "libkrun_build_microvm_register_event_subscriber",
+        || {
+            event_manager
+                .add_subscriber(vmm.clone())
+                .map_err(StartMicrovmError::RegisterEvent)
+        },
+    )?;
 
     Ok(vmm)
+}
+
+fn measure_builder_phase<T>(
+    profiler: Option<&KrunProfiler>,
+    label: &'static str,
+    f: impl FnOnce() -> T,
+) -> T {
+    match profiler {
+        Some(profiler) => profiler.measure(label, f),
+        None => f(),
+    }
 }
 
 fn load_external_kernel(

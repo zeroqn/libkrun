@@ -1,0 +1,160 @@
+name: Publish loftd libkrun prebuilts
+
+on:
+  push:
+    branches:
+      - loftd
+
+permissions:
+  contents: write
+
+concurrency:
+  group: loftd-libkrun-prebuilt-releases
+  cancel-in-progress: false
+
+env:
+  RELEASE_PREFIX: loftd
+  SCCACHE_GHA_ENABLED: "true"
+  RUSTC_WRAPPER: sccache
+
+jobs:
+  build:
+    name: Build ${{ matrix.system }} libkrun prebuilt package
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - system: x86_64-linux
+            runner: ubuntu-latest
+            host_arch: x86_64
+            asset: libkrun-x86_64-linux-full.tgz
+          - system: aarch64-linux
+            runner: ubuntu-24.04-arm
+            host_arch: aarch64
+            asset: libkrun-aarch64-linux-full.tgz
+
+    steps:
+      - name: Code checkout
+        uses: actions/checkout@v4
+
+      - name: Set up build environment
+        uses: ./.github/actions/setup-build-env
+
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
+
+      - name: Build libkrun full-feature package
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = "${{ matrix.host_arch }}"
+
+          mkdir -p .sccache-wrappers
+          cat > .sccache-wrappers/cc <<'EOF'
+          #!/usr/bin/env bash
+          exec sccache cc "$@"
+          EOF
+          cat > .sccache-wrappers/cxx <<'EOF'
+          #!/usr/bin/env bash
+          exec sccache c++ "$@"
+          EOF
+          chmod +x .sccache-wrappers/cc .sccache-wrappers/cxx
+          export CC="$PWD/.sccache-wrappers/cc"
+          export CXX="$PWD/.sccache-wrappers/cxx"
+
+          make clean
+          make BLK=1 NET=1 GPU=1 SND=1 INPUT=1
+          make DESTDIR="$PWD/tmp" PREFIX=/usr install
+
+          rm -rf pkgroot
+          mkdir -p pkgroot
+          cp -a tmp/usr/lib64 pkgroot/lib64
+          cp -a tmp/usr/include pkgroot/include
+
+          test -f pkgroot/include/libkrun.h
+          test -f pkgroot/include/libkrun_display.h
+          test -f pkgroot/include/libkrun_input.h
+          test -f pkgroot/lib64/pkgconfig/libkrun.pc
+          test -n "$(find pkgroot/lib64 -maxdepth 1 -name 'libkrun.so*' -print -quit)"
+
+          tar -C pkgroot -czf "${{ matrix.asset }}" lib64 include
+          tar -tzf "${{ matrix.asset }}" | grep -Fx lib64/pkgconfig/libkrun.pc
+          if tar -tzf "${{ matrix.asset }}" | grep -E '(^/|^tmp/)'; then
+            echo "unexpected absolute or tmp-prefixed archive member" >&2
+            exit 1
+          fi
+          if tar -xOzf "${{ matrix.asset }}" lib64/pkgconfig/libkrun.pc | grep -F "$PWD"; then
+            echo "pkg-config file contains a workspace path" >&2
+            exit 1
+          fi
+
+          make clean
+        shell: bash
+
+      - name: Show sccache stats
+        if: always()
+        run: sccache --show-stats
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: libkrun-${{ matrix.system }}
+          path: ${{ matrix.asset }}
+          if-no-files-found: error
+
+  publish-release:
+    name: Publish loftd libkrun prerelease
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Download prebuilt artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: libkrun-*
+          path: dist
+          merge-multiple: true
+
+      - name: Create prerelease and upload assets
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          short_sha="${GITHUB_SHA::12}"
+          tag_name="${RELEASE_PREFIX}-${short_sha}"
+
+          test -f dist/libkrun-x86_64-linux-full.tgz
+          test -f dist/libkrun-aarch64-linux-full.tgz
+
+          if gh release view "${tag_name}" >/dev/null 2>&1; then
+            gh release delete "${tag_name}" --yes --cleanup-tag
+          fi
+
+          gh release create "${tag_name}" \
+            --target "${GITHUB_SHA}" \
+            --title "loftd libkrun ${short_sha}" \
+            --notes "Full-feature Linux libkrun artifacts for loftd commit ${GITHUB_SHA}. Built with BLK, NET, GPU, SND, and INPUT enabled." \
+            --prerelease
+
+          gh release upload "${tag_name}" dist/*.tgz --clobber
+        shell: bash
+
+  prune-old-loftd-releases:
+    name: Keep latest 10 loftd libkrun prereleases
+    runs-on: ubuntu-latest
+    needs: publish-release
+    steps:
+      - name: Delete older loftd releases and tags
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          gh release list --limit 100 --json tagName,createdAt \
+            --jq 'sort_by(.createdAt) | reverse | map(select(.tagName | startswith("loftd-"))) | .[10:][]?.tagName' |
+          while IFS= read -r tag_name; do
+            [ -n "${tag_name}" ] || continue
+            echo "Deleting old loftd libkrun release ${tag_name}"
+            gh release delete "${tag_name}" --yes --cleanup-tag
+          done
+        shell: bash

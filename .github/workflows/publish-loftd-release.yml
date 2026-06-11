@@ -49,18 +49,7 @@ jobs:
           set -euo pipefail
           test "$(uname -m)" = "${{ matrix.host_arch }}"
 
-          mkdir -p .sccache-wrappers
-          cat > .sccache-wrappers/cc <<'EOF'
-          #!/usr/bin/env bash
-          exec sccache cc "$@"
-          EOF
-          cat > .sccache-wrappers/cxx <<'EOF'
-          #!/usr/bin/env bash
-          exec sccache c++ "$@"
-          EOF
-          chmod +x .sccache-wrappers/cc .sccache-wrappers/cxx
-          export CC="$PWD/.sccache-wrappers/cc"
-          export CXX="$PWD/.sccache-wrappers/cxx"
+          sccache --version
 
           make clean
           make BLK=1 NET=1 GPU=1 SND=1 INPUT=1

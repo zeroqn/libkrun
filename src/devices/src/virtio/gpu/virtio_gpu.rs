@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::env;
 use std::io::IoSliceMut;
 #[cfg(target_os = "linux")]
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, RawFd};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -34,7 +34,7 @@ use rutabaga_gfx::{
 use rutabaga_gfx::{
     RUTABAGA_CHANNEL_TYPE_WAYLAND, RUTABAGA_MAP_CACHE_MASK, ResourceCreate3D, ResourceCreateBlob,
     Rutabaga, RutabagaBuilder, RutabagaChannel, RutabagaFence, RutabagaFenceHandler, RutabagaIovec,
-    Transfer3D,
+    RutabagaFromRawDescriptor, Transfer3D,
 };
 #[cfg(target_os = "macos")]
 use utils::worker_message::WorkerMessage;
@@ -221,6 +221,7 @@ impl VirtioGpu {
         interrupt: InterruptTransport,
         fence_state: Arc<Mutex<FenceState>>,
         virgl_flags: u32,
+        render_server_fd: Option<RawFd>,
         export_table: Option<ExportTable>,
     ) -> Option<Rutabaga> {
         let xdg_runtime_dir = match env::var("XDG_RUNTIME_DIR") {
@@ -278,7 +279,12 @@ impl VirtioGpu {
 
         let fence =
             Self::create_fence_handler(mem, queue_ctl.clone(), fence_state.clone(), interrupt);
-        builder.clone().build(fence.clone(), None).ok()
+        let server_descriptor = render_server_fd.map(|fd| unsafe {
+            // SAFETY: the render-server fd is supplied by the host loftd supervisor and
+            // transferred to virglrenderer, which takes ownership on success.
+            rutabaga_gfx::RutabagaDescriptor::from_raw_descriptor(fd)
+        });
+        builder.clone().build(fence.clone(), server_descriptor).ok()
     }
 
     pub fn create_fallback_rutabaga(
@@ -305,6 +311,7 @@ impl VirtioGpu {
         queue_ctl: Arc<Mutex<VirtQueue>>,
         interrupt: InterruptTransport,
         virgl_flags: u32,
+        render_server_fd: Option<RawFd>,
         #[cfg(target_os = "macos")] map_sender: Sender<WorkerMessage>,
         export_table: Option<ExportTable>,
         displays: Box<[DisplayInfo]>,
@@ -318,6 +325,7 @@ impl VirtioGpu {
             interrupt.clone(),
             fence_state.clone(),
             virgl_flags,
+            render_server_fd,
             export_table.clone(),
         ) {
             Some(rutabaga) => rutabaga,

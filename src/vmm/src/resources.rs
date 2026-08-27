@@ -177,6 +177,7 @@ pub struct VmResources {
     /// Flags for the virtio-gpu device.
     pub gpu_virgl_flags: Option<u32>,
     pub gpu_shm_size: Option<usize>,
+    pub gpu_render_server_fd: Option<RawFd>,
     #[cfg(feature = "gpu")]
     pub display_backend: Option<DisplayBackend<'static>>,
     #[cfg(feature = "gpu")]
@@ -358,6 +359,10 @@ impl VmResources {
         self.gpu_shm_size = Some(shm_size);
     }
 
+    pub fn set_gpu_render_server_fd(&mut self, render_server_fd: RawFd) {
+        self.gpu_render_server_fd = Some(render_server_fd);
+    }
+
     pub fn set_console_output(&mut self, console_output: PathBuf) {
         self.console_output = Some(console_output);
     }
@@ -432,6 +437,7 @@ mod tests {
             net: Default::default(),
             gpu_virgl_flags: None,
             gpu_shm_size: None,
+            gpu_render_server_fd: None,
             #[cfg(feature = "gpu")]
             display_backend: None,
             #[cfg(feature = "gpu")]

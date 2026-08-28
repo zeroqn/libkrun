@@ -33,8 +33,8 @@ use rutabaga_gfx::{
 };
 use rutabaga_gfx::{
     RUTABAGA_CHANNEL_TYPE_WAYLAND, RUTABAGA_MAP_CACHE_MASK, ResourceCreate3D, ResourceCreateBlob,
-    Rutabaga, RutabagaBuilder, RutabagaChannel, RutabagaFence, RutabagaFenceHandler, RutabagaIovec,
-    RutabagaFromRawDescriptor, Transfer3D,
+    Rutabaga, RutabagaBuilder, RutabagaChannel, RutabagaFence, RutabagaFenceHandler,
+    RutabagaFromRawDescriptor, RutabagaIovec, Transfer3D,
 };
 #[cfg(target_os = "macos")]
 use utils::worker_message::WorkerMessage;

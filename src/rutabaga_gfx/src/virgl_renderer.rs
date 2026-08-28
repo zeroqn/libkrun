@@ -185,18 +185,6 @@ extern "C" fn debug_callback(fmt: *const ::std::os::raw::c_char, ap: stdio::va_l
         // vsnprintf returns the number of chars that *would* have been printed
         let len = min(printed_len as usize, BUF_LEN - 1);
         let msg = String::from_utf8_lossy(&v[..len]);
-        // Diagnostic: persist virgl log messages to a file, since the loftd
-        // tracing subscriber does not install the log->tracing bridge and
-        // would otherwise drop these.
-        std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open("/tmp/virgl-debug.log")
-            .and_then(|mut f| {
-                use std::io::Write;
-                writeln!(f, "{msg}")
-            })
-            .ok();
         debug!("{msg}");
     }
 }
@@ -248,8 +236,16 @@ unsafe extern "C" fn get_drm_fd(cookie: *mut c_void) -> c_int {
 
         // virglrenderer takes ownership of the returned fd in two separate
         // paths (the vrend winsys closes it; vaGetDisplayDRM consumes it for
-        // video), so each call must return a fresh descriptor.
-        let result = match std::fs::File::open("/dev/dri/renderD128") {
+        // video), so each call must return a fresh descriptor. The node must be
+        // opened O_RDWR: Mesa's virtio-gpu vdrm driver mmaps its shmem buffer
+        // with PROT_WRITE, which the kernel rejects with EACCES on an O_RDONLY
+        // render-node fd and makes vaInitialize fail with
+        // VA_STATUS_ERROR_ALLOCATION_FAILED.
+        let result = match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/dri/renderD128")
+        {
             Ok(f) => f.into_raw_fd(),
             Err(_) => match &cookie.drm_fd {
                 Some(fd) => {
@@ -262,130 +258,6 @@ unsafe extern "C" fn get_drm_fd(cookie: *mut c_void) -> c_int {
                 None => -1,
             },
         };
-
-        let mut log_line = String::new();
-        let base = cookie.drm_fd.as_ref().map(|f| f.as_raw_fd());
-        log_line.push_str(&format!("get_drm_fd cookie_drm_fd={base:?} returned={result}"));
-        let dri = std::path::Path::new("/run/opengl-driver/lib/dri/virtio_gpu_drv_video.so");
-        log_line.push_str(&format!(" dri_exists={}", dri.exists()));
-
-        // Diagnostic: the VM worker is forked from a multi-threaded loftd
-        // process, so glibc's dlopen scope chains can be inconsistent after
-        // the fork. vrend's video init -> libva va_openDriver dlopens the VA
-        // driver, whose DT_NEEDED for libva.so.2 triggers a fresh load instead
-        // of the inherited copy; that fresh load fails because vaGetDisplayDRM
-        // lives in libva-drm.so.2 (mutual DT_NEEDED). Pre-registering both in
-        // the global scope before video init makes the driver's DT_NEEDED
-        // resolve to the already-loaded copies.
-        unsafe {
-            let reg = |name: &[u8]| -> String {
-                let h = libc::dlopen(
-                    name.as_ptr() as *const libc::c_char,
-                    libc::RTLD_NOW | libc::RTLD_GLOBAL,
-                );
-                if h.is_null() {
-                    let e = std::ffi::CStr::from_ptr(libc::dlerror() as *const libc::c_char)
-                        .to_string_lossy()
-                        .into_owned();
-                    format!("{}=fail({e})", String::from_utf8_lossy(&name[..name.len() - 1]))
-                } else {
-                    let r = format!("{}=ok", String::from_utf8_lossy(&name[..name.len() - 1]));
-                    libc::dlclose(h);
-                    r
-                }
-            };
-            log_line.push_str(&format!(" {}", reg(b"libva.so.2\0")));
-            log_line.push_str(&format!(" {}", reg(b"libva-drm.so.2\0")));
-        }
-
-        // Diagnostic: probe libva directly from inside the VM worker process.
-        // This isolates whether vaInitialize fails at driver discovery, dlopen,
-        // or gallium screen creation, and captures the exact VAStatus/error.
-        unsafe {
-            type FnVaGetDisplayDRM = unsafe extern "C" fn(i32) -> *mut libc::c_void;
-            type FnVaInitialize =
-                unsafe extern "C" fn(*mut libc::c_void, *mut i32, *mut i32) -> i32;
-            type FnVaErrorStr = unsafe extern "C" fn(i32) -> *const libc::c_char;
-            type FnVaQueryVendorString = unsafe extern "C" fn(*mut libc::c_void) -> *const libc::c_char;
-            type FnVaMaxNumProfiles = unsafe extern "C" fn(*mut libc::c_void) -> i32;
-            type FnVaQueryConfigProfiles =
-                unsafe extern "C" fn(*mut libc::c_void, *mut i32, *mut i32) -> i32;
-
-            unsafe fn cstr(p: *const libc::c_char) -> String {
-                if p.is_null() {
-                    "<null>".to_string()
-                } else {
-                    std::ffi::CStr::from_ptr(p).to_string_lossy().into_owned()
-                }
-            }
-
-            let libva = libc::dlopen(
-                b"libva.so.2\0".as_ptr() as *const libc::c_char,
-                libc::RTLD_NOW | libc::RTLD_LOCAL,
-            );
-            if libva.is_null() {
-                let e = cstr(libc::dlerror() as *const libc::c_char);
-                log_line.push_str(&format!(" libva_dlopen=failed({e})"));
-            } else {
-                let mut sym = |name: &[u8]| -> *mut libc::c_void {
-                    libc::dlsym(libva, name.as_ptr() as *const libc::c_char)
-                };
-                let get_display = sym(b"vaGetDisplayDRM\0") as *const FnVaGetDisplayDRM;
-                let init = sym(b"vaInitialize\0") as *const FnVaInitialize;
-                let err_str = sym(b"vaErrorStr\0") as *const FnVaErrorStr;
-                let vendor = sym(b"vaQueryVendorString\0") as *const FnVaQueryVendorString;
-                let max_profiles = sym(b"vaMaxNumProfiles\0") as *const FnVaMaxNumProfiles;
-                let query_profiles = sym(b"vaQueryConfigProfiles\0") as *const FnVaQueryConfigProfiles;
-
-                if !get_display.is_null() && !init.is_null() {
-                    let gd = *get_display;
-                    let ini = *init;
-                    let dpy = gd(result);
-                    log_line.push_str(&format!(" vaGetDisplayDRM={}", !dpy.is_null()));
-                    if !dpy.is_null() {
-                        let mut major = 0;
-                        let mut minor = 0;
-                        let status = ini(dpy, &mut major, &mut minor);
-                        log_line.push_str(&format!(
-                            " vaInitialize={status} major={major} minor={minor}"
-                        ));
-                        if status == 0 {
-                            if !vendor.is_null() {
-                                let vp = (*vendor)(dpy);
-                                log_line.push_str(&format!(" vendor=\"{}\"", cstr(vp)));
-                            }
-                            if !max_profiles.is_null() && !query_profiles.is_null() {
-                                let n = (*max_profiles)(dpy);
-                                if n > 0 {
-                                    let mut buf = vec![0i32; n as usize];
-                                    let mut num = n;
-                                    let qs = (*query_profiles)(dpy, buf.as_mut_ptr(), &mut num);
-                                    log_line.push_str(&format!(
-                                        " vaMaxNumProfiles={n} vaQueryConfigProfiles={qs} num={num}"
-                                    ));
-                                } else {
-                                    log_line.push_str(&format!(" vaMaxNumProfiles={n}"));
-                                }
-                            }
-                        } else if !err_str.is_null() {
-                            let ep = (*err_str)(status);
-                            log_line.push_str(&format!(" vaErrorStr=\"{}\"", cstr(ep)));
-                        }
-                    }
-                }
-                libc::dlclose(libva);
-            }
-        }
-
-        std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open("/tmp/virgl-getdrmfd.log")
-            .and_then(|mut f| {
-                use std::io::Write;
-                writeln!(f, "{log_line}")
-            })
-            .ok();
         result
     })
     .unwrap_or_else(|_| abort())
@@ -397,16 +269,16 @@ unsafe extern "C" fn get_drm_fd(cookie: *mut c_void) -> c_int {
 fn open_host_render_node() -> Option<SafeDescriptor> {
     for index in 128..132 {
         let path = format!("/dev/dri/renderD{index}");
-        match std::fs::File::open(&path) {
+        match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+        {
             Ok(file) => {
-                std::fs::write("/tmp/virgl-getdrmfd.log",
-                    format!("open_host_render_node: opened {path} fd={}\n",
-                        file.as_raw_fd())).ok();
                 return Some(unsafe { SafeDescriptor::from_raw_descriptor(file.into_raw_fd()) });
             }
             Err(e) => {
-                std::fs::write("/tmp/virgl-getdrmfd.log",
-                    format!("open_host_render_node: {path} failed: {e}\n")).ok();
+                warn!("open_host_render_node: {path} failed: {e}");
             }
         }
     }

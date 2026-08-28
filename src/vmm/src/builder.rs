@@ -13,9 +13,9 @@ use std::fmt::{Display, Formatter};
 use std::fs::File;
 use std::io::{self, IsTerminal, Read};
 use std::os::fd::AsRawFd;
-use std::os::fd::{BorrowedFd, FromRawFd};
 #[cfg(feature = "gpu")]
 use std::os::fd::RawFd;
+use std::os::fd::{BorrowedFd, FromRawFd};
 use std::path::PathBuf;
 use std::sync::atomic::AtomicI32;
 use std::sync::{Arc, Mutex};

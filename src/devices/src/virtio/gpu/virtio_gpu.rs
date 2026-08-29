@@ -68,7 +68,7 @@ fn sglist_to_rutabaga_iovecs(
     Ok(rutabaga_iovecs)
 }
 
-#[derive(PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum VirtioGpuRing {
     Global,
     ContextSpecific { ctx_id: u32, ring_idx: u8 },
@@ -166,11 +166,6 @@ impl VirtioGpu {
         interrupt: InterruptTransport,
     ) -> RutabagaFenceHandler {
         RutabagaFenceHandler::new(move |completed_fence: RutabagaFence| {
-            debug!(
-                "XXX - fence called: id={}, ring_idx={}",
-                completed_fence.fence_id, completed_fence.ring_idx
-            );
-
             let mut queue = queue_ctl.lock().unwrap();
             let mut fence_state = fence_state.lock().unwrap();
             let mut i = 0;
@@ -184,7 +179,6 @@ impl VirtioGpu {
             };
 
             while i < fence_state.descs.len() {
-                debug!("XXX - fence_id: {}", fence_state.descs[i].fence_id);
                 if fence_state.descs[i].ring == ring
                     && fence_state.descs[i].fence_id <= completed_fence.fence_id
                 {
@@ -701,6 +695,18 @@ impl VirtioGpu {
         Ok(OkNoData)
     }
 
+    /// Polls the rutabaga component (virglrenderer) to retire completed fences and
+    /// signal the guest. Must be called whenever `poll_descriptor()` is signaled.
+    pub fn event_poll(&mut self) {
+        self.rutabaga.event_poll();
+    }
+
+    /// Returns a pollable descriptor that is signaled when there are fences to
+    /// retire. `None` if the component does not support polling (e.g. no virgl).
+    pub fn poll_descriptor(&self) -> Option<rutabaga_gfx::RutabagaDescriptor> {
+        self.rutabaga.poll_descriptor()
+    }
+
     pub fn process_fence(
         &mut self,
         ring: VirtioGpuRing,
@@ -711,7 +717,8 @@ impl VirtioGpu {
         // In case the fence is signaled immediately after creation, don't add a return
         // FenceDescriptor.
         let mut fence_state = self.fence_state.lock().unwrap();
-        if fence_id > *fence_state.completed_fences.get(&ring).unwrap_or(&0) {
+        let completed = *fence_state.completed_fences.get(&ring).unwrap_or(&0);
+        if fence_id > completed {
             fence_state.descs.push(FenceDescriptor {
                 ring,
                 fence_id,

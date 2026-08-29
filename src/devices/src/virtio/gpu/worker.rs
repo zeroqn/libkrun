@@ -9,7 +9,7 @@ use utils::eventfd::EventFd;
 #[cfg(target_os = "macos")]
 use crossbeam_channel::Sender;
 use rutabaga_gfx::{
-    RUTABAGA_PIPE_BIND_RENDER_TARGET, RUTABAGA_PIPE_TEXTURE_2D, ResourceCreate3D,
+    AsRawDescriptor, RUTABAGA_PIPE_BIND_RENDER_TARGET, RUTABAGA_PIPE_TEXTURE_2D, ResourceCreate3D,
     ResourceCreateBlob, RutabagaFence, Transfer3D,
 };
 #[cfg(target_os = "macos")]
@@ -104,15 +104,69 @@ impl Worker {
             self.display_backend,
         );
 
+        // Get the virgl fence-retirement eventfd once (it lives for the worker's lifetime).
+        let virgl_poll_fd = virtio_gpu.poll_descriptor().map(|d| d.as_raw_descriptor());
+
         loop {
-            if let Err(e) = self.control_evt.read() {
-                error!("Failed to read control_evt: {e:?}");
+            // Poll both the control queue event and the virgl fence-retirement eventfd.
+            // The virgl eventfd is written by vrend's fence-sync thread once a signaled
+            // GL fence is ready to retire; without polling it, `vrend_renderer_check_fences`
+            // is never called and the guest's fenced execbuf descriptors are never marked
+            // used, hanging the guest on `DRM_IOCTL_VIRTGPU_WAIT`.
+            let mut pfds = [
+                libc::pollfd {
+                    fd: self.control_evt.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+                libc::pollfd {
+                    fd: -1,
+                    events: 0,
+                    revents: 0,
+                },
+            ];
+            let mut nfds = 1;
+            if let Some(fd) = virgl_poll_fd {
+                pfds[1] = libc::pollfd {
+                    fd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                nfds = 2;
+            }
+
+            // Poll with a short timeout so ongoing fence retirement
+            // (via event_poll) runs promptly even when the virgl eventfd
+            // is not signaled (fences go to vrend's fence_list rather than
+            // fence_wait_list in this configuration).
+            let ret = unsafe { libc::poll(pfds.as_mut_ptr(), nfds as libc::nfds_t, 10) };
+            if ret < 0 {
+                error!(
+                    "gpu worker poll failed: {}",
+                    std::io::Error::last_os_error()
+                );
                 continue;
             }
-            if self.process_queue(&mut virtio_gpu, &self.control_queue.clone())
-                && let Err(e) = self.interrupt.try_signal_used_queue()
-            {
-                error!("Error signaling queue: {e:?}");
+
+            // On poll timeout, retire any completed fences sitting in fence_list.
+            if ret == 0 {
+                virtio_gpu.event_poll();
+            }
+
+            if pfds[0].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
+                if let Err(e) = self.control_evt.read() {
+                    error!("Failed to read control_evt: {e:?}");
+                    continue;
+                }
+                if self.process_queue(&mut virtio_gpu, &self.control_queue.clone())
+                    && let Err(e) = self.interrupt.try_signal_used_queue()
+                {
+                    error!("Error signaling queue: {e:?}");
+                }
+            }
+
+            if nfds > 1 && pfds[1].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
+                virtio_gpu.event_poll();
             }
         }
     }

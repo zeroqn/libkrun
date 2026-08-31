@@ -2,7 +2,8 @@ use std::collections::BTreeMap;
 use std::env;
 use std::io::IoSliceMut;
 #[cfg(target_os = "linux")]
-use std::os::fd::{AsRawFd, RawFd};
+use std::os::fd::AsRawFd;
+use std::os::fd::{IntoRawFd, OwnedFd};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -166,8 +167,11 @@ impl VirtioGpu {
         interrupt: InterruptTransport,
     ) -> RutabagaFenceHandler {
         RutabagaFenceHandler::new(move |completed_fence: RutabagaFence| {
-            let mut queue = queue_ctl.lock().unwrap();
-            let mut fence_state = fence_state.lock().unwrap();
+            // The handler runs inside virglrenderer's C callbacks, which are wrapped in
+            // catch_unwind(...).unwrap_or_else(|_| abort()); a poisoned mutex would panic
+            // and abort the whole VM process, so recover the lock instead.
+            let mut queue = queue_ctl.lock().unwrap_or_else(|e| e.into_inner());
+            let mut fence_state = fence_state.lock().unwrap_or_else(|e| e.into_inner());
             let mut i = 0;
 
             let ring = match completed_fence.flags & VIRTIO_GPU_FLAG_INFO_RING_IDX {
@@ -215,7 +219,7 @@ impl VirtioGpu {
         interrupt: InterruptTransport,
         fence_state: Arc<Mutex<FenceState>>,
         virgl_flags: u32,
-        render_server_fd: Option<RawFd>,
+        render_server_fd: Option<OwnedFd>,
         export_table: Option<ExportTable>,
     ) -> Option<Rutabaga> {
         let xdg_runtime_dir = match env::var("XDG_RUNTIME_DIR") {
@@ -274,9 +278,9 @@ impl VirtioGpu {
         let fence =
             Self::create_fence_handler(mem, queue_ctl.clone(), fence_state.clone(), interrupt);
         let server_descriptor = render_server_fd.map(|fd| unsafe {
-            // SAFETY: the render-server fd is supplied by the host loftd supervisor and
+            // SAFETY: we own fd (moved from the krun_set_gpu_options3 ABI); it is
             // transferred to virglrenderer, which takes ownership on success.
-            rutabaga_gfx::RutabagaDescriptor::from_raw_descriptor(fd)
+            rutabaga_gfx::RutabagaDescriptor::from_raw_descriptor(fd.into_raw_fd())
         });
         builder.clone().build(fence.clone(), server_descriptor).ok()
     }
@@ -305,7 +309,7 @@ impl VirtioGpu {
         queue_ctl: Arc<Mutex<VirtQueue>>,
         interrupt: InterruptTransport,
         virgl_flags: u32,
-        render_server_fd: Option<RawFd>,
+        render_server_fd: Option<OwnedFd>,
         #[cfg(target_os = "macos")] map_sender: Sender<WorkerMessage>,
         export_table: Option<ExportTable>,
         displays: Box<[DisplayInfo]>,

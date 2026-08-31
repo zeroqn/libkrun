@@ -16,7 +16,6 @@ use std::os::raw::c_char;
 use std::os::raw::c_int;
 use std::os::raw::c_void;
 use std::os::unix::io::AsRawFd;
-use std::os::unix::io::IntoRawFd;
 use std::panic::catch_unwind;
 use std::process::abort;
 use std::ptr::null_mut;
@@ -241,24 +240,19 @@ unsafe extern "C" fn get_drm_fd(cookie: *mut c_void) -> c_int {
         // with PROT_WRITE, which the kernel rejects with EACCES on an O_RDONLY
         // render-node fd and makes vaInitialize fail with
         // VA_STATUS_ERROR_ALLOCATION_FAILED.
-        let result = match std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open("/dev/dri/renderD128")
-        {
-            Ok(f) => f.into_raw_fd(),
-            Err(_) => match &cookie.drm_fd {
-                Some(fd) => {
-                    let dup = unsafe { libc::dup(fd.as_raw_fd()) };
-                    if dup < 0 {
-                        warn!("get_drm_fd: dup failed: {}", SysError::last_os_error());
-                    }
-                    dup
+        match &cookie.drm_fd {
+            Some(fd) => {
+                let dup = unsafe { libc::dup(fd.as_raw_fd()) };
+                if dup < 0 {
+                    warn!("get_drm_fd: dup failed: {}", SysError::last_os_error());
                 }
+                dup
+            }
+            None => match open_host_render_node() {
+                Some(f) => f.into_raw_descriptor(),
                 None => -1,
             },
-        };
-        result
+        }
     })
     .unwrap_or_else(|_| abort())
 }
@@ -267,19 +261,24 @@ unsafe extern "C" fn get_drm_fd(cookie: *mut c_void) -> c_int {
 /// video (libva's vaGetDisplayDRM). Returns None if no render node is usable;
 /// in that case video stays disabled but GL/Venus still work.
 fn open_host_render_node() -> Option<SafeDescriptor> {
-    for index in 128..132 {
-        let path = format!("/dev/dri/renderD{index}");
+    // Enumerate /dev/dri instead of probing a fixed renderD128..131 range:
+    // render-node indices depend on kernel probe order and DRM topology.
+    let dir = std::fs::read_dir("/dev/dri").ok()?;
+    let mut nodes: Vec<String> = dir
+        .filter_map(|e| e.ok())
+        .filter_map(|e| e.file_name().into_string().ok())
+        .filter(|name| name.starts_with("renderD"))
+        .map(|name| format!("/dev/dri/{name}"))
+        .collect();
+    nodes.sort();
+    for path in nodes {
         match std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .open(&path)
         {
-            Ok(file) => {
-                return Some(unsafe { SafeDescriptor::from_raw_descriptor(file.into_raw_fd()) });
-            }
-            Err(e) => {
-                warn!("open_host_render_node: {path} failed: {e}");
-            }
+            Ok(file) => return Some(SafeDescriptor::from(file)),
+            Err(e) => warn!("open_host_render_node: {path} failed: {e}"),
         }
     }
     None

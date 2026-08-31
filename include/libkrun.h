@@ -610,6 +610,24 @@ int32_t krun_set_gpu_options2(uint32_t ctx_id,
                               uint32_t virgl_flags,
                               uint64_t shm_size);
 
+/**
+ * Enables and configures a virtio-gpu device. This variant allows passing a
+ * render-server socketpair fd to virglrenderer.
+ *
+ * Arguments:
+ *  "ctx_id"           - the configuration context ID.
+ *  "virgl_flags"      - flags to pass to virglrenderer.
+ *  "shm_size"         - size of the SHM host window in bytes.
+ *  "render_server_fd" - fd of the render server, or a negative value if none.
+ *
+ * Returns:
+ *  Zero on success or a negative error number on failure.
+ */
+int32_t krun_set_gpu_options3(uint32_t ctx_id,
+                              uint32_t virgl_flags,
+                              uint64_t shm_size,
+                              int32_t render_server_fd);
+
 /* Maximum number of displays. Same as VIRTIO_GPU_MAX_SCANOUTS defined in the virtio-gpu spec */
 #define KRUN_MAX_DISPLAYS 16
 

@@ -7,7 +7,7 @@
 use std::fs::File;
 #[cfg(feature = "tee")]
 use std::io::BufReader;
-use std::os::fd::RawFd;
+use std::os::fd::{OwnedFd, RawFd};
 use std::path::PathBuf;
 
 #[cfg(feature = "tee")]
@@ -177,7 +177,7 @@ pub struct VmResources {
     /// Flags for the virtio-gpu device.
     pub gpu_virgl_flags: Option<u32>,
     pub gpu_shm_size: Option<usize>,
-    pub gpu_render_server_fd: Option<RawFd>,
+    pub gpu_render_server_fd: Option<OwnedFd>,
     #[cfg(feature = "gpu")]
     pub display_backend: Option<DisplayBackend<'static>>,
     #[cfg(feature = "gpu")]
@@ -359,7 +359,7 @@ impl VmResources {
         self.gpu_shm_size = Some(shm_size);
     }
 
-    pub fn set_gpu_render_server_fd(&mut self, render_server_fd: RawFd) {
+    pub fn set_gpu_render_server_fd(&mut self, render_server_fd: OwnedFd) {
         self.gpu_render_server_fd = Some(render_server_fd);
     }
 

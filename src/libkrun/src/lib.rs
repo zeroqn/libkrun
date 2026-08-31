@@ -29,7 +29,7 @@ use std::fs::File;
 use std::io::IsTerminal;
 #[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
-use std::os::fd::{BorrowedFd, FromRawFd, RawFd};
+use std::os::fd::{BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::path::PathBuf;
 use std::slice;
 use std::sync::LazyLock;
@@ -188,7 +188,7 @@ struct ContextConfig {
     shutdown_efd: Option<EventFd>,
     gpu_virgl_flags: Option<u32>,
     gpu_shm_size: Option<usize>,
-    gpu_render_server_fd: Option<RawFd>,
+    gpu_render_server_fd: Option<OwnedFd>,
     console_output: Option<PathBuf>,
     vmm_uid: Option<libc::uid_t>,
     vmm_gid: Option<libc::gid_t>,
@@ -356,8 +356,8 @@ impl ContextConfig {
         self.gpu_shm_size = Some(shm_size);
     }
 
-    fn set_gpu_render_server_fd(&mut self, render_server_fd: RawFd) {
-        self.gpu_render_server_fd = Some(render_server_fd);
+    fn set_gpu_render_server_fd(&mut self, render_server_fd: Option<OwnedFd>) {
+        self.gpu_render_server_fd = render_server_fd;
     }
 
     fn set_vmm_uid(&mut self, vmm_uid: libc::uid_t) {
@@ -1672,6 +1672,16 @@ pub unsafe extern "C" fn krun_set_gpu_options3(
     shm_size: u64,
     render_server_fd: i32,
 ) -> i32 {
+    // Wrap the fd in an OwnedFd so libkrun owns it and closes it on every
+    // error path; a negative fd means "no render server".
+    let render_server_fd = if render_server_fd < 0 {
+        None
+    } else {
+        // SAFETY: a non-negative fd handed over by the caller; ownership is
+        // transferred to libkrun and ultimately to virglrenderer on success.
+        Some(unsafe { OwnedFd::from_raw_fd(render_server_fd) })
+    };
+
     match CTX_MAP.lock().unwrap().entry(ctx_id) {
         Entry::Occupied(mut ctx_cfg) => {
             let cfg = ctx_cfg.get_mut();
@@ -3233,7 +3243,7 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
     let (sender, _receiver) = unbounded();
 
     let _vmm = match vmm::builder::build_microvm(
-        &ctx_cfg.vmr,
+        &mut ctx_cfg.vmr,
         &mut event_manager,
         ctx_cfg.shutdown_efd,
         sender,

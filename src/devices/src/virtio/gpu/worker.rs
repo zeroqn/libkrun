@@ -1,5 +1,5 @@
 use std::io::Read;
-use std::os::fd::{AsRawFd, BorrowedFd, RawFd};
+use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
@@ -37,7 +37,7 @@ pub struct Worker {
     interrupt: InterruptTransport,
     shm_region: VirtioShmRegion,
     virgl_flags: u32,
-    render_server_fd: Option<RawFd>,
+    render_server_fd: Option<OwnedFd>,
     #[cfg(target_os = "macos")]
     map_sender: Sender<WorkerMessage>,
     export_table: Option<ExportTable>,
@@ -53,7 +53,7 @@ impl Worker {
         interrupt: InterruptTransport,
         shm_region: VirtioShmRegion,
         virgl_flags: u32,
-        render_server_fd: Option<RawFd>,
+        render_server_fd: Option<OwnedFd>,
         #[cfg(target_os = "macos")] map_sender: Sender<WorkerMessage>,
         export_table: Option<ExportTable>,
         displays: Box<[DisplayInfo]>,
@@ -96,7 +96,7 @@ impl Worker {
             self.control_queue.clone(),
             self.interrupt.clone(),
             self.virgl_flags,
-            self.render_server_fd,
+            self.render_server_fd.take(),
             #[cfg(target_os = "macos")]
             self.map_sender.clone(),
             self.export_table.take(),
@@ -105,7 +105,9 @@ impl Worker {
         );
 
         // Get the virgl fence-retirement eventfd once (it lives for the worker's lifetime).
-        let virgl_poll_fd = virtio_gpu.poll_descriptor().map(|d| d.as_raw_descriptor());
+        // Keep the SafeDescriptor itself: as_raw_descriptor() only borrows the fd, and
+        // dropping it would close the descriptor we poll on every loop iteration.
+        let virgl_poll_fd = virtio_gpu.poll_descriptor();
 
         loop {
             // Poll both the control queue event and the virgl fence-retirement eventfd.
@@ -126,9 +128,9 @@ impl Worker {
                 },
             ];
             let mut nfds = 1;
-            if let Some(fd) = virgl_poll_fd {
+            if let Some(descriptor) = &virgl_poll_fd {
                 pfds[1] = libc::pollfd {
-                    fd,
+                    fd: descriptor.as_raw_descriptor(),
                     events: libc::POLLIN,
                     revents: 0,
                 };

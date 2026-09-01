@@ -137,11 +137,18 @@ impl Worker {
                 nfds = 2;
             }
 
-            // Poll with a short timeout so ongoing fence retirement
-            // (via event_poll) runs promptly even when the virgl eventfd
-            // is not signaled (fences go to vrend's fence_list rather than
-            // fence_wait_list in this configuration).
-            let ret = unsafe { libc::poll(pfds.as_mut_ptr(), nfds as libc::nfds_t, 10) };
+            // Poll with a short timeout while a fence is outstanding so ongoing
+            // fence retirement (via event_poll) runs promptly even when the
+            // virgl eventfd is not signaled (fences go to vrend's fence_list
+            // rather than fence_wait_list in this configuration).  When idle
+            // there is nothing to retire, so block indefinitely and avoid
+            // waking ~100 times per second on every idle VM.
+            let timeout = if virtio_gpu.has_pending_fence() {
+                10
+            } else {
+                -1
+            };
+            let ret = unsafe { libc::poll(pfds.as_mut_ptr(), nfds as libc::nfds_t, timeout) };
             if ret < 0 {
                 error!(
                     "gpu worker poll failed: {}",
@@ -150,7 +157,8 @@ impl Worker {
                 continue;
             }
 
-            // On poll timeout, retire any completed fences sitting in fence_list.
+            // On poll timeout (only possible with a pending fence), retire any
+            // completed fences sitting in fence_list.
             if ret == 0 {
                 virtio_gpu.event_poll();
             }

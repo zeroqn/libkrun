@@ -248,10 +248,9 @@ unsafe extern "C" fn get_drm_fd(cookie: *mut c_void) -> c_int {
                 }
                 dup
             }
-            None => match open_host_render_node() {
-                Some(f) => f.into_raw_descriptor(),
-                None => -1,
-            },
+            // No render node was opened (DRM/VA not requested, or none usable);
+            // return -1 so video stays disabled.
+            None => -1,
         }
     })
     .unwrap_or_else(|_| abort())
@@ -375,9 +374,17 @@ impl VirglRenderer {
         // Otherwise, Resource and Context would become invalid because their lifetime is not tied
         // to the Renderer instance. Doing so greatly simplifies the ownership for users of this
         // library.
+        //
+        // The DRM render node is only opened when the DRM/VA-API native-context flag is set;
+        // otherwise the guest gets no render-node fd via get_drm_fd, keeping GL-only VMs from
+        // reaching host libva/DRM code.
         let cookie = Box::into_raw(Box::new(RutabagaCookie {
             render_server_fd,
-            drm_fd: open_host_render_node(),
+            drm_fd: if virglrenderer_flags.drm() {
+                open_host_render_node()
+            } else {
+                None
+            },
             fence_handler: Some(fence_handler),
             debug_handler: None,
         }));
@@ -396,6 +403,11 @@ impl VirglRenderer {
         // If the initialization failed, allow the users to try again.
         if ret != 0 {
             INIT_ONCE.store(false, Ordering::Release);
+
+            // virglrenderer did not take ownership of the cookie on failure;
+            // reclaim it so the render-server fd and drm fd are closed instead
+            // of leaked.
+            let _ = unsafe { Box::from_raw(cookie) };
         }
 
         ret_to_res(ret)?;

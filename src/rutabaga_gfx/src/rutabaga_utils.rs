@@ -417,6 +417,12 @@ impl VirglRendererFlags {
         self.set_flag(VIRGLRENDERER_DRM, v)
     }
 
+    /// Returns true if the DRM native-context flag is set (VA-API video and
+    /// render-node GL winsys).
+    pub fn drm(self) -> bool {
+        self.0 & VIRGLRENDERER_DRM != 0
+    }
+
     /// Use EGL for context creation.
     pub fn use_egl(self, v: bool) -> VirglRendererFlags {
         self.set_flag(VIRGLRENDERER_USE_EGL, v)

@@ -734,6 +734,18 @@ impl VirtioGpu {
         }
     }
 
+    /// True while at least one fenced descriptor is still awaiting retirement
+    /// by the fence handler.  When false, the worker can block indefinitely
+    /// on the poll eventfd, avoiding periodic wakeups on idle VMs.
+    pub fn has_pending_fence(&self) -> bool {
+        !self
+            .fence_state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .descs
+            .is_empty()
+    }
+
     /// Creates a blob resource using rutabaga.
     pub fn resource_create_blob(
         &mut self,

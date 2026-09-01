@@ -736,6 +736,18 @@ impl VirtioGpu {
         }
     }
 
+    /// True while at least one fenced descriptor is still awaiting retirement
+    /// by the fence handler.  When false, the worker can block indefinitely
+    /// on the poll eventfd, avoiding periodic wakeups on idle VMs.
+    pub fn has_pending_fence(&self) -> bool {
+        !self
+            .fence_state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .descs
+            .is_empty()
+    }
+
     /// Creates a blob resource using rutabaga.
     pub fn resource_create_blob(
         &mut self,
@@ -769,6 +781,17 @@ impl VirtioGpu {
         Ok(self.result_from_query(resource_id))
     }
 
+    /// Returns the host address to mmap at, or None if `offset + size` overflows
+    /// or exceeds the SHM region.  Accepts either `host_addr` or `guest_addr` as
+    /// `base` — the caller knows which is appropriate for the platform.
+    fn checked_mapping_addr(base: u64, region_size: u64, offset: u64, size: u64) -> Option<u64> {
+        let end = offset.checked_add(size)?;
+        if end > region_size {
+            return None;
+        }
+        base.checked_add(offset)
+    }
+
     /// Uses the hypervisor to map the rutabaga blob resource.
     ///
     /// When sandboxing is disabled, external_blob is unset and opaque fds are mapped by
@@ -798,10 +821,15 @@ impl VirtioGpu {
                     _ => panic!("unexpected prot mode for mapping"),
                 };
 
-                if offset + resource.size > shm_region.size as u64 {
+                let Some(addr) = Self::checked_mapping_addr(
+                    shm_region.host_addr,
+                    shm_region.size as u64,
+                    offset,
+                    resource.size,
+                ) else {
                     error!("mapping DOES NOT FIT");
-                }
-                let addr = shm_region.host_addr + offset;
+                    return Err(ErrUnspec);
+                };
                 debug!(
                     "mapping: host_addr={:x}, addr={:x}, size={}",
                     shm_region.host_addr, addr, resource.size
@@ -853,11 +881,15 @@ impl VirtioGpu {
             _ => panic!("unexpected prot mode for mapping"),
         };
 
-        if offset + resource.size > shm_region.size as u64 {
+        let Some(addr) = Self::checked_mapping_addr(
+            shm_region.host_addr,
+            shm_region.size as u64,
+            offset,
+            resource.size,
+        ) else {
             error!("resource map doesn't fit in shm region");
             return Err(ErrUnspec);
-        }
-        let addr = shm_region.host_addr + offset;
+        };
 
         if let Ok(export) = self.rutabaga.export_blob(resource_id) {
             // SHM and DMABUF are both regular host fds whose pages can be exposed
@@ -925,12 +957,15 @@ impl VirtioGpu {
 
         if let Ok(export) = self.rutabaga.export_blob(resource_id) {
             if export.handle_type == RUTABAGA_MEM_HANDLE_TYPE_APPLE {
-                if offset + resource.size > shm_region.size as u64 {
+                let Some(guest_addr) = Self::checked_mapping_addr(
+                    shm_region.guest_addr,
+                    shm_region.size as u64,
+                    offset,
+                    resource.size,
+                ) else {
                     error!("mapping DOES NOT FIT");
                     return Err(ErrUnspec);
-                }
-
-                let guest_addr = shm_region.guest_addr + offset;
+                };
                 debug!(
                     "mapping: map_ptr={:x}, guest_addr={:x}, size={}",
                     map_ptr, guest_addr, resource.size
@@ -1072,5 +1107,37 @@ mod test {
             .filter(|&i| i % 2 != 0)
             .for_each(|scanout| scanouts.disable(scanout));
         assert!(!scanouts.has_any_enabled());
+    }
+
+    #[test]
+    fn checked_mapping_addr_rejects_overflow_and_bounds_violation() {
+        // Overflowing offset+size must be rejected, not wrapped.
+        assert_eq!(
+            super::VirtioGpu::checked_mapping_addr(0x1000, 0x1000, u64::MAX, 1),
+            None
+        );
+        assert_eq!(
+            super::VirtioGpu::checked_mapping_addr(0x1000, 0x1000, u64::MAX - 1, 2),
+            None
+        );
+        // Fits exactly.
+        assert_eq!(
+            super::VirtioGpu::checked_mapping_addr(0x1000, 0x1000, 0, 0x1000),
+            Some(0x1000)
+        );
+        assert_eq!(
+            super::VirtioGpu::checked_mapping_addr(0x1000, 0x1000, 0x800, 0x800),
+            Some(0x1800)
+        );
+        // Beyond the region.
+        assert_eq!(
+            super::VirtioGpu::checked_mapping_addr(0x1000, 0x1000, 0x800, 0x801),
+            None
+        );
+        // Base overflow.
+        assert_eq!(
+            super::VirtioGpu::checked_mapping_addr(u64::MAX, 0x1000, 0x100, 1),
+            None
+        );
     }
 }

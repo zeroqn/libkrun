@@ -155,6 +155,7 @@ pub struct BlockWorker {
     mem: GuestMemoryMmap,
     disk: DiskProperties,
     stop_fd: EventFd,
+    parallel_reads: bool,
 }
 
 impl BlockWorker {
@@ -164,6 +165,7 @@ impl BlockWorker {
         mem: GuestMemoryMmap,
         disk: DiskProperties,
         stop_fd: EventFd,
+        parallel_reads: bool,
     ) -> Self {
         Self {
             device_queue,
@@ -171,6 +173,7 @@ impl BlockWorker {
             mem,
             disk,
             stop_fd,
+            parallel_reads,
         }
     }
 
@@ -188,15 +191,12 @@ impl BlockWorker {
             mem,
             disk,
             stop_fd,
+            parallel_reads,
         } = self;
         let DeviceQueue { queue, event } = device_queue;
         let virtq_ev_fd = event.as_raw_fd();
         let stop_ev_fd = stop_fd.as_raw_fd();
 
-        let read_pool_size = thread::available_parallelism()
-            .map(|n| n.get().clamp(2, 8))
-            .unwrap_or(4);
-        let (read_tx, read_rx) = unbounded::<ReadJob>();
         let shared = Arc::new(SharedState {
             queue: Mutex::new(queue),
             mem,
@@ -204,18 +204,27 @@ impl BlockWorker {
             disk,
         });
 
-        let mut read_workers: Vec<JoinHandle<()>> = (0..read_pool_size)
-            .map(|i| {
-                thread::Builder::new()
-                    .name(format!("block read worker {i}"))
-                    .spawn({
-                        let rx = read_rx.clone();
-                        let shared = shared.clone();
-                        move || read_worker(rx, shared)
-                    })
-                    .unwrap()
-            })
-            .collect();
+        let (read_tx, mut read_workers) = if parallel_reads {
+            let read_pool_size = thread::available_parallelism()
+                .map(|n| n.get().clamp(2, 8))
+                .unwrap_or(4);
+            let (read_tx, read_rx) = unbounded::<ReadJob>();
+            let workers: Vec<JoinHandle<()>> = (0..read_pool_size)
+                .map(|i| {
+                    thread::Builder::new()
+                        .name(format!("block read worker {i}"))
+                        .spawn({
+                            let rx = read_rx.clone();
+                            let shared = shared.clone();
+                            move || read_worker(rx, shared)
+                        })
+                        .unwrap()
+                })
+                .collect();
+            (Some(read_tx), workers)
+        } else {
+            (None, Vec::new())
+        };
 
         let mut epoll = Epoll::new().unwrap();
 
@@ -243,7 +252,7 @@ impl BlockWorker {
                                 if let Err(e) = event.read() {
                                     error!("Failed to get queue event: {e:?}");
                                 } else {
-                                    Self::process_virtio_queues(&shared, &read_tx);
+                                    Self::process_virtio_queues(&shared, read_tx.as_ref());
                                 }
                             }
                             EventSet::IN if source == stop_ev_fd => {
@@ -270,7 +279,7 @@ impl BlockWorker {
         }
     }
 
-    fn process_virtio_queues(shared: &Arc<SharedState>, read_tx: &Sender<ReadJob>) {
+    fn process_virtio_queues(shared: &Arc<SharedState>, read_tx: Option<&Sender<ReadJob>>) {
         let mem = &shared.mem;
         loop {
             let requests = {
@@ -299,7 +308,7 @@ impl BlockWorker {
 
     fn dispatch_request(
         shared: &Arc<SharedState>,
-        read_tx: &Sender<ReadJob>,
+        read_tx: Option<&Sender<ReadJob>>,
         head: DescriptorChain<'_>,
     ) {
         let head_index = head.index;
@@ -329,7 +338,9 @@ impl BlockWorker {
             }
         };
 
-        if request_header.request_type == VIRTIO_BLK_T_IN {
+        if request_header.request_type == VIRTIO_BLK_T_IN
+            && let Some(read_tx) = read_tx
+        {
             let data_len = writer.available_bytes().saturating_sub(1);
             // SAFETY: `writer` was created from `SharedState.mem`. The job is
             // processed only by a worker that holds `Arc<SharedState>`, and
@@ -365,6 +376,16 @@ impl BlockWorker {
         disk: &DiskProperties,
     ) -> result::Result<usize, RequestError> {
         match request_header.request_type {
+            VIRTIO_BLK_T_IN => {
+                let data_len = writer.available_bytes().saturating_sub(1);
+                if !data_len.is_multiple_of(512) {
+                    Err(RequestError::InvalidDataLength)
+                } else {
+                    writer
+                        .write_from_at(disk, data_len, request_header.sector * 512)
+                        .map_err(RequestError::WritingToDescriptor)
+                }
+            }
             VIRTIO_BLK_T_OUT => {
                 let data_len = reader.available_bytes();
                 if !data_len.is_multiple_of(512) {

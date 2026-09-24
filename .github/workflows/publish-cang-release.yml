@@ -1,19 +1,19 @@
-name: Publish loftd libkrun prebuilts
+name: Publish cang libkrun prebuilts
 
 on:
   push:
     branches:
-      - loftd
+      - cang
 
 permissions:
   contents: write
 
 concurrency:
-  group: loftd-libkrun-prebuilt-releases
+  group: cang-libkrun-prebuilt-releases
   cancel-in-progress: false
 
 env:
-  RELEASE_PREFIX: loftd
+  RELEASE_PREFIX: cang
   SCCACHE_GHA_ENABLED: "true"
   RUSTC_WRAPPER: sccache
 
@@ -92,7 +92,7 @@ jobs:
           if-no-files-found: error
 
   publish-release:
-    name: Publish loftd libkrun prerelease
+    name: Publish cang libkrun prerelease
     runs-on: ubuntu-latest
     needs: build
     steps:
@@ -121,29 +121,29 @@ jobs:
 
           gh release create "${tag_name}" \
             --target "${GITHUB_SHA}" \
-            --title "loftd libkrun ${short_sha}" \
-            --notes "Full-feature Linux libkrun artifacts for loftd commit ${GITHUB_SHA}. Built with BLK, NET, GPU, SND, and INPUT enabled." \
+            --title "cang libkrun ${short_sha}" \
+            --notes "Full-feature Linux libkrun artifacts for cang commit ${GITHUB_SHA}. Built with BLK, NET, GPU, SND, and INPUT enabled." \
             --prerelease
 
           gh release upload "${tag_name}" dist/*.tgz --clobber
         shell: bash
 
-  prune-old-loftd-releases:
-    name: Keep latest 10 loftd libkrun prereleases
+  prune-old-cang-releases:
+    name: Keep latest 10 cang libkrun prereleases
     runs-on: ubuntu-latest
     needs: publish-release
     steps:
-      - name: Delete older loftd releases and tags
+      - name: Delete older cang releases and tags
         env:
           GITHUB_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
           gh release list --limit 100 --json tagName,createdAt \
-            --jq 'sort_by(.createdAt) | reverse | map(select(.tagName | startswith("loftd-"))) | .[10:][]?.tagName' |
+            --jq 'sort_by(.createdAt) | reverse | map(select(.tagName | startswith("cang-"))) | .[10:][]?.tagName' |
           while IFS= read -r tag_name; do
             [ -n "${tag_name}" ] || continue
-            echo "Deleting old loftd libkrun release ${tag_name}"
+            echo "Deleting old cang libkrun release ${tag_name}"
             gh release delete "${tag_name}" --yes --cleanup-tag
           done
         shell: bash

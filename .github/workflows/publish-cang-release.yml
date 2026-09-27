@@ -57,7 +57,7 @@ jobs:
           sccache --version
 
           make clean
-          make BLK=1 NET=1 GPU=1 SND=1 INPUT=1
+          make BLK=1 NET=1 GPU=1 INPUT=1 TIMESYNC=1
           make DESTDIR="$PWD/tmp" PREFIX=/usr install
 
           rm -rf pkgroot
@@ -68,8 +68,13 @@ jobs:
           test -f pkgroot/include/libkrun.h
           test -f pkgroot/include/libkrun_display.h
           test -f pkgroot/include/libkrun_input.h
+          test -f pkgroot/include/libkrun_init.h
           test -f pkgroot/lib64/pkgconfig/libkrun.pc
+          test -f pkgroot/lib64/pkgconfig/libkrun_init.pc
           test -n "$(find pkgroot/lib64 -maxdepth 1 -name 'libkrun.so*' -print -quit)"
+          # cang cannot boot without the init blob: upstream main moved the
+          # guest init out of libkrun.so into libkrun_init.so.
+          test -n "$(find pkgroot/lib64 -maxdepth 1 -name 'libkrun_init.so*' -print -quit)"
 
           tar -C pkgroot -czf "${{ matrix.asset }}" lib64 include
           tar -tzf "${{ matrix.asset }}" | grep -Fx lib64/pkgconfig/libkrun.pc

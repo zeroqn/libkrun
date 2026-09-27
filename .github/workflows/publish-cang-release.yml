@@ -11,7 +11,10 @@ permissions:
   contents: write
 
 concurrency:
-  group: cang-libkrun-prebuilt-releases
+  # Scoped per ref so a tag-triggered permanent release never queues behind an
+  # in-flight branch build (the x86_64 LTO kernel job alone is ~30 minutes).
+  # Pushes to the same ref still serialize.
+  group: cang-libkrun-prebuilt-releases-${{ github.ref_name }}
   cancel-in-progress: false
 
 env:

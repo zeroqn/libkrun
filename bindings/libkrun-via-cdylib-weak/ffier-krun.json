@@ -1329,6 +1329,34 @@
           "ffi_name": "krun_vmm_builder_payload"
         },
         {
+          "name": "set_profile_path",
+          "doc": [
+            " Record per-phase launch timings to `profile_path` as TSV rows",
+            " (`<label>\\t<duration_nanos>`).",
+            "",
+            " Opt-in and best-effort: an unusable path or a failed write never changes",
+            " launch behavior, it only means fewer rows."
+          ],
+          "receiver": "value",
+          "params": [
+            {
+              "name": "profile_path",
+              "param_kind": "regular",
+              "type": "str",
+              "ref_kind": "shared"
+            }
+          ],
+          "ret": {
+            "return_kind": "result",
+            "ok": {
+              "type": "Self"
+            },
+            "err_type": "VmmError",
+            "c_convention": "out_param"
+          },
+          "ffi_name": "krun_vmm_builder_set_profile_path"
+        },
+        {
           "name": "devices",
           "receiver": "value",
           "params": [
@@ -2378,6 +2406,34 @@
             "type": "GpuDevice"
           },
           "ffi_name": "krun_gpu_device_new"
+        },
+        {
+          "name": "set_render_server_fd",
+          "doc": [
+            " Hand the device the caller's end of the render-server socketpair.",
+            "",
+            " virglrenderer receives it as its server descriptor, which is what enables",
+            " the sandboxed venus render-server path (`VIRGLRENDERER_RENDER_SERVER`).",
+            " A negative fd means \"no render server\" and is rejected, because the fd can",
+            " only be a real descriptor here."
+          ],
+          "receiver": "value",
+          "params": [
+            {
+              "name": "render_server_fd",
+              "param_kind": "regular",
+              "type": "RawFd"
+            }
+          ],
+          "ret": {
+            "return_kind": "result",
+            "ok": {
+              "type": "Self"
+            },
+            "err_type": "VmmError",
+            "c_convention": "out_param"
+          },
+          "ffi_name": "krun_gpu_device_set_render_server_fd"
         },
         {
           "name": "shm_size",

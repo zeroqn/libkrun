@@ -1,4 +1,5 @@
 use std::io::Write;
+use std::os::fd::OwnedFd;
 
 #[cfg(target_os = "macos")]
 use crossbeam_channel::Sender;
@@ -37,6 +38,7 @@ pub struct Gpu {
     pub(crate) device_state: DeviceState,
     shm_region: Option<VirtioShmRegion>,
     virgl_flags: u32,
+    render_server_fd: Option<OwnedFd>,
     #[cfg(target_os = "macos")]
     map_sender: Sender<WorkerMessage>,
     export_table: Option<ExportTable>,
@@ -47,6 +49,7 @@ pub struct Gpu {
 impl Gpu {
     pub fn new(
         virgl_flags: u32,
+        render_server_fd: Option<OwnedFd>,
         displays: Box<[DisplayInfo]>,
         display_backend: DisplayBackend<'static>,
         #[cfg(target_os = "macos")] map_sender: Sender<WorkerMessage>,
@@ -57,6 +60,7 @@ impl Gpu {
             device_state: DeviceState::Inactive,
             shm_region: None,
             virgl_flags,
+            render_server_fd,
             #[cfg(target_os = "macos")]
             map_sender,
             export_table: None,
@@ -214,6 +218,7 @@ impl VirtioDevice for Gpu {
             interrupt.clone(),
             shm_region,
             self.virgl_flags,
+            self.render_server_fd.take(),
             #[cfg(target_os = "macos")]
             self.map_sender.clone(),
             self.export_table.take(),

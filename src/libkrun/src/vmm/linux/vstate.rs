@@ -2055,6 +2055,7 @@ mod tests {
             &[],
             None,
             false,
+            false,
             &Payload::Empty,
             false,
             #[cfg(feature = "tee")]

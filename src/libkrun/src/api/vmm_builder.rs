@@ -1,6 +1,7 @@
 use std::marker::PhantomData;
 #[cfg(not(target_os = "windows"))]
 use std::os::fd::{AsRawFd, BorrowedFd};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 #[cfg(target_os = "macos")]
@@ -20,12 +21,14 @@ use utils::pollable_channel::PollableChannelSender;
 use super::device_builders::{DeviceManager, MmioDeviceManager};
 use super::error::VmmError;
 use super::payload::Payload;
+use crate::vmm::profile::KrunProfiler;
 
 #[derive(Default)]
 pub struct VmmBuilder<'a> {
     vcpus: Option<u8>,
     ram_mib: Option<u32>,
     payload: Option<Payload>,
+    profile_path: Option<String>,
     device_manager: Option<Box<dyn DeviceManager<'a> + 'a>>,
     #[cfg(unix)]
     serial_consoles: Vec<SerialConsoleConfig>,
@@ -62,6 +65,19 @@ impl<'a> VmmBuilder<'a> {
     pub fn payload(mut self, payload: Payload) -> Self {
         self.payload = Some(payload);
         self
+    }
+
+    /// Record per-phase launch timings to `profile_path` as TSV rows
+    /// (`<label>\t<duration_nanos>`).
+    ///
+    /// Opt-in and best-effort: an unusable path or a failed write never changes
+    /// launch behavior, it only means fewer rows.
+    pub fn set_profile_path(mut self, profile_path: &str) -> Result<Self, VmmError> {
+        if profile_path.is_empty() {
+            return Err(VmmError::InvalidParam());
+        }
+        self.profile_path = Some(profile_path.to_string());
+        Ok(self)
     }
 
     pub fn devices(mut self, devices: MmioDeviceManager<'a>) -> Self {
@@ -312,8 +328,25 @@ pub fn check_nested_virt() -> bool {
     }
 }
 
+/// Time `f` into the launch profile when profiling is on, otherwise run it plain.
+fn measure_phase<T>(
+    profiler: Option<&KrunProfiler>,
+    label: &'static str,
+    f: impl FnOnce() -> T,
+) -> T {
+    match profiler {
+        Some(profiler) => profiler.measure(label, f),
+        None => f(),
+    }
+}
+
 fn build_vm(builder_cfg: VmmBuilder<'_>) -> Result<Vmm<'_>, VmmError> {
     use super::payload::PayloadKind;
+
+    let profiler = KrunProfiler::start(builder_cfg.profile_path.as_deref().map(PathBuf::from));
+    if let Some(profiler) = &profiler {
+        profiler.record_marker("libkrun_build_vm_enter");
+    }
 
     let vcpus_count = builder_cfg
         .vcpus
@@ -417,8 +450,12 @@ fn build_vm(builder_cfg: VmmBuilder<'_>) -> Result<Vmm<'_>, VmmError> {
         vm_resources.serial_consoles = builder_cfg.serial_consoles;
     }
 
-    let mut event_manager =
-        EventManager::new().map_err(|e| VmmError::Internal(format!("{e:?}")))?;
+    let mut event_manager = measure_phase(
+        profiler.as_ref(),
+        "libkrun_build_vm_event_manager_create",
+        EventManager::new,
+    )
+    .map_err(|e| VmmError::Internal(format!("{e:?}")))?;
 
     let (sender, receiver) = unbounded();
 
@@ -442,6 +479,7 @@ fn build_vm(builder_cfg: VmmBuilder<'_>) -> Result<Vmm<'_>, VmmError> {
         None,
         sender.clone(),
         device_manager,
+        profiler.as_ref(),
     )
     .map_err(|e| VmmError::BootError(format!("{e:?}")))?;
 

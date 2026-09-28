@@ -3,9 +3,11 @@ use std::collections::HashMap;
 use std::ffi::CString;
 use std::io::IsTerminal;
 use std::marker::PhantomData;
-#[cfg(all(feature = "net", not(target_os = "windows")))]
+#[cfg(all(feature = "gpu", not(target_os = "windows")))]
+use std::os::fd::FromRawFd;
+#[cfg(all(any(feature = "net", feature = "gpu"), not(target_os = "windows")))]
 use std::os::fd::OwnedFd;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", all(feature = "gpu", not(target_os = "windows"))))]
 use std::os::fd::RawFd;
 #[cfg(not(target_os = "windows"))]
 use std::os::fd::{AsRawFd, BorrowedFd};
@@ -1635,6 +1637,7 @@ export_bitflags! {
 #[cfg(feature = "gpu")]
 pub struct GpuDevice {
     virgl_flags: u32,
+    render_server_fd: Option<OwnedFd>,
     backend: DisplayBackend,
     shm_size: usize,
 }
@@ -1647,9 +1650,26 @@ impl GpuDevice {
     pub fn new(virgl_flags: VirglRendererFlags, backend: DisplayBackend) -> Self {
         Self {
             virgl_flags: virgl_flags.bits(),
+            render_server_fd: None,
             backend,
             shm_size: Self::DEFAULT_SHM_SIZE,
         }
+    }
+
+    /// Hand the device the caller's end of the render-server socketpair.
+    ///
+    /// virglrenderer receives it as its server descriptor, which is what enables
+    /// the sandboxed venus render-server path (`VIRGLRENDERER_RENDER_SERVER`).
+    /// A negative fd means "no render server" and is rejected, because the fd can
+    /// only be a real descriptor here.
+    pub fn set_render_server_fd(mut self, render_server_fd: RawFd) -> Result<Self, VmmError> {
+        if render_server_fd < 0 {
+            return Err(VmmError::BadFd());
+        }
+        // SAFETY: the fd is a live descriptor handed over by the caller; the
+        // device owns it from here and closes it if the VM never starts.
+        self.render_server_fd = Some(unsafe { OwnedFd::from_raw_fd(render_server_fd) });
+        Ok(self)
     }
 
     pub fn shm_size(mut self, size: usize) -> Self {
@@ -1675,6 +1695,7 @@ impl<'a> AttachDevice<'a> for GpuDevice {
 
         let gpu = devices::virtio::Gpu::new(
             self.virgl_flags,
+            self.render_server_fd,
             displays,
             self.backend.inner,
             #[cfg(target_os = "macos")]

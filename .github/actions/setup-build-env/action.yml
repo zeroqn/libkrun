@@ -70,6 +70,7 @@ runs:
           clang \
           lld \
           pkg-config \
+          binutils \
           libepoxy-dev \
           libdrm-dev \
           clang-format \

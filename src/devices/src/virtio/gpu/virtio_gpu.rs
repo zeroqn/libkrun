@@ -19,10 +19,7 @@ use krun_display::{
     DisplayBackend, DisplayBackendBasicFramebuffer, DisplayBackendInstance, Rect, ResourceFormat,
 };
 use libc::c_void;
-#[cfg(any(
-    all(target_os = "linux", feature = "virgl_resource_map2"),
-    target_os = "macos"
-))]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use rutabaga_gfx::RUTABAGA_HANDLE_TYPE_MEM_DMABUF;
 #[cfg(all(not(feature = "virgl_resource_map2"), target_os = "linux"))]
 use rutabaga_gfx::RUTABAGA_HANDLE_TYPE_MEM_OPAQUE_FD;
@@ -37,9 +34,11 @@ use rutabaga_gfx::{
 use rutabaga_gfx::{
     RUTABAGA_MAP_CACHE_MASK, RUTABAGA_PATH_TYPE_WAYLAND, ResourceCreate3D, ResourceCreateBlob,
     Rutabaga, RutabagaBuilder, RutabagaDescriptor, RutabagaFence, RutabagaFenceHandler,
-    RutabagaFromRawDescriptor, RutabagaIovec, RutabagaPath, RutabagaResult, Transfer3D,
-    VirtioFsLookup,
+    RutabagaFromRawDescriptor, RutabagaHandle, RutabagaIovec, RutabagaMagmaHandle, RutabagaPath,
+    RutabagaResult, Transfer3D, VirtioFsLookup,
 };
+#[cfg(target_os = "linux")]
+use utils::linux::udmabuf::UdmabufDriver;
 #[cfg(target_os = "macos")]
 use utils::worker_message::WorkerMessage;
 use vm_memory::{GuestAddress, GuestMemoryBackend, GuestMemoryMmap, VolatileSlice};
@@ -230,8 +229,17 @@ pub struct VirtioGpu {
     rutabaga: Rutabaga,
     resources: BTreeMap<u32, VirtioGpuResource>,
     fence_state: Arc<Mutex<FenceState>>,
+    #[cfg(target_os = "linux")]
+    udmabuf_driver: Option<UdmabufDriver>,
     #[cfg(target_os = "macos")]
     map_sender: Sender<WorkerMessage>,
+    /// Capset id of every context we created, by ctx_id.
+    ///
+    /// Rutabaga routes a blob whose ctx is not the cross-domain context to the
+    /// default component, whose `create_blob` drops the handle we just made
+    /// from the guest's memory - the guest then renders without it. Keeping
+    /// this lets the device say so instead of failing silently.
+    context_capset_ids: BTreeMap<u32, u32>,
     scanouts: [Option<VirtioGpuScanout>; VIRTIO_GPU_MAX_SCANOUTS as usize],
     displays: Box<[DisplayInfo]>,
     display_backend: DisplayBackendInstance,
@@ -424,6 +432,7 @@ impl VirtioGpu {
         interrupt: InterruptTransport,
         virgl_flags: u32,
         render_server_fd: Option<OwnedFd>,
+        #[cfg(target_os = "linux")] udmabuf_driver: Option<UdmabufDriver>,
         #[cfg(target_os = "macos")] map_sender: Sender<WorkerMessage>,
         export_table: Option<ExportTable>,
         displays: Box<[DisplayInfo]>,
@@ -463,9 +472,12 @@ impl VirtioGpu {
             rutabaga,
             resources: Default::default(),
             fence_state,
+            context_capset_ids: Default::default(),
             scanouts: Default::default(),
             displays,
             display_backend,
+            #[cfg(target_os = "linux")]
+            udmabuf_driver,
             #[cfg(target_os = "macos")]
             map_sender,
         }
@@ -774,12 +786,17 @@ impl VirtioGpu {
     ) -> VirtioGpuResult {
         self.rutabaga
             .create_context(ctx_id, context_init, context_name)?;
+        self.context_capset_ids.insert(
+            ctx_id,
+            context_init & rutabaga_gfx::RUTABAGA_CONTEXT_INIT_CAPSET_ID_MASK,
+        );
         Ok(OkNoData)
     }
 
     /// Destroys a rutabaga context.
     pub fn destroy_context(&mut self, ctx_id: u32) -> VirtioGpuResult {
         self.rutabaga.destroy_context(ctx_id)?;
+        self.context_capset_ids.remove(&ctx_id);
         Ok(OkNoData)
     }
 
@@ -862,6 +879,24 @@ impl VirtioGpu {
         }
     }
 
+    /// Report a guest-handle blob whose context cannot carry the handle.
+    ///
+    /// The device still creates the resource; the warning is what turns "the
+    /// guest renders wrong pixels" into something diagnosable.
+    fn warn_if_guest_handle_cannot_be_routed(&self, ctx_id: u32, resource_id: u32) {
+        let cross_domain = self
+            .context_capset_ids
+            .get(&ctx_id)
+            .is_some_and(|capset| *capset == rutabaga_gfx::RUTABAGA_CAPSET_CROSS_DOMAIN);
+        if !cross_domain {
+            warn!(
+                "Resource {resource_id} carries a guest handle but ctx {ctx_id} is not the \
+                 cross-domain context, so the handle is dropped and the guest will not get \
+                 zero-copy"
+            );
+        }
+    }
+
     /// Creates a blob resource using rutabaga.
     pub fn resource_create_blob(
         &mut self,
@@ -872,12 +907,39 @@ impl VirtioGpu {
         mem: &GuestMemoryMmap,
     ) -> VirtioGpuResult {
         let mut rutabaga_iovecs = None;
+        let mut handle = None;
 
         if resource_create_blob.blob_flags & VIRTIO_GPU_BLOB_FLAG_CREATE_GUEST_HANDLE != 0 {
-            panic!("GUEST_HANDLE unimplemented");
+            // The guest negotiated VIRTIO_GPU_F_CREATE_GUEST_HANDLE, so a real
+            // udmabuf driver has to be behind us; we only advertise the bit
+            // when it opened.
+            let Some(driver) = &self.udmabuf_driver else {
+                warn!("Guest created a guest-handle blob but no udmabuf driver is present");
+                return Err(ErrUnspec);
+            };
+
+            // Failing here is deliberate: the guest already switched to its
+            // zero-copy path, so creating the blob without the handle it asked
+            // for would render wrong pixels with nothing to notice. An error
+            // response makes the import fail where the guest can see it.
+            let udmabuf = driver.create_udmabuf(mem, &vecs).inspect_err(|err| {
+                warn!("Failed to create udmabuf for resource {resource_id}: {err}");
+            }).map_err(|_| ErrUnspec)?;
+
+            handle = Some(RutabagaHandle::from(RutabagaMagmaHandle {
+                // SAFETY: udmabuf_create returned a fresh descriptor we own.
+                os_handle: unsafe {
+                    RutabagaDescriptor::from_raw_descriptor(udmabuf.into_raw_fd())
+                },
+                handle_type: RUTABAGA_HANDLE_TYPE_MEM_DMABUF,
+            }));
         } else if resource_create_blob.blob_mem != VIRTIO_GPU_BLOB_MEM_HOST3D {
             rutabaga_iovecs =
                 Some(sglist_to_rutabaga_iovecs(&vecs[..], mem).map_err(|_| ErrUnspec)?);
+        }
+
+        if handle.is_some() {
+            self.warn_if_guest_handle_cannot_be_routed(ctx_id, resource_id);
         }
 
         self.rutabaga.resource_create_blob(
@@ -885,7 +947,7 @@ impl VirtioGpu {
             resource_id,
             resource_create_blob,
             rutabaga_iovecs,
-            None,
+            handle,
         )?;
 
         let resource = VirtioGpuResource::new(resource_id, 0, 0, None, resource_create_blob.size);

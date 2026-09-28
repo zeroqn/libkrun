@@ -27,6 +27,7 @@ mod defs {
         /* The following capabilities are not upstreamed. */
         pub const VIRTIO_GPU_F_RESOURCE_SYNC: u32 = 5;
         pub const VIRTIO_GPU_F_CREATE_GUEST_HANDLE: u32 = 6;
+        pub const VIRTIO_GPU_F_BLOB_CTX_ID_FIX: u32 = 7;
 
         #[derive(Copy, Clone, Debug, Default)]
         #[repr(C)]

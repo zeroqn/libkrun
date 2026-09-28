@@ -636,6 +636,19 @@ KrunResult krun_gpu_device_set_render_server_fd(KrunGpuDevice* handle, int rende
 typedef KrunResult (*krun_gpu_device_set_render_server_fd_fn)(KrunGpuDevice* handle, int render_server_fd, KrunError* err_out);
 void krun_gpu_device_shm_size(KrunGpuDevice* handle, size_t size);
 typedef void (*krun_gpu_device_shm_size_fn)(KrunGpuDevice* handle, size_t size);
+/**
+ * Ask for the zero-copy SHM fast path (cang's `--zero-copy-shm`).
+ *
+ * The probe lives here on purpose: opening `/dev/udmabuf` is the same
+ * question as "can this host serve a guest handle", so probing once makes
+ * withholding `VIRTIO_GPU_F_CREATE_GUEST_HANDLE` and keeping guest RAM
+ * anonymous (`requirements().zero_copy_shm == false`, which
+ * `create_guest_memory` reads) one decision rather than two that can
+ * disagree. A host that cannot serve it keeps the copy path with a
+ * warning, rather than negotiating a feature it cannot honour.
+ */
+void krun_gpu_device_set_zero_copy_shm(KrunGpuDevice* handle, bool enable);
+typedef void (*krun_gpu_device_set_zero_copy_shm_fn)(KrunGpuDevice* handle, bool enable);
 void krun_gpu_device_destroy(KrunGpuDevice handle);
 typedef void (*krun_gpu_device_destroy_fn)(KrunGpuDevice handle);
 

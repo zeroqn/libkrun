@@ -389,6 +389,15 @@ typedef KrunResult (*krun_vmm_builder_ram_mib_fn)(KrunVmmBuilder* handle, uint32
 void krun_vmm_builder_payload(KrunVmmBuilder* handle, KrunPayload payload);
 typedef void (*krun_vmm_builder_payload_fn)(KrunVmmBuilder* handle, KrunPayload payload);
 /**
+ * Record per-phase launch timings to `profile_path` as TSV rows
+ * (`<label>\t<duration_nanos>`).
+ *
+ * Opt-in and best-effort: an unusable path or a failed write never changes
+ * launch behavior, it only means fewer rows.
+ */
+KrunResult krun_vmm_builder_set_profile_path(KrunVmmBuilder* handle, KrunStr profile_path, KrunError* err_out);
+typedef KrunResult (*krun_vmm_builder_set_profile_path_fn)(KrunVmmBuilder* handle, KrunStr profile_path, KrunError* err_out);
+/**
  * Add devices using their manager's transport.
  *
  * PCI devices require ACPI to be enabled with [`VmmBuilder::acpi`].
@@ -648,6 +657,16 @@ typedef void (*krun_display_backend_destroy_fn)(KrunDisplayBackend handle);
 
 KrunGpuDevice krun_gpu_device_new(uint32_t virgl_flags, KrunDisplayBackend backend);
 typedef KrunGpuDevice (*krun_gpu_device_new_fn)(uint32_t virgl_flags, KrunDisplayBackend backend);
+/**
+ * Hand the device the caller's end of the render-server socketpair.
+ *
+ * virglrenderer receives it as its server descriptor, which is what enables
+ * the sandboxed venus render-server path (`VIRGLRENDERER_RENDER_SERVER`).
+ * A negative fd means "no render server" and is rejected, because the fd can
+ * only be a real descriptor here.
+ */
+KrunResult krun_gpu_device_set_render_server_fd(KrunGpuDevice* handle, int render_server_fd, KrunError* err_out);
+typedef KrunResult (*krun_gpu_device_set_render_server_fd_fn)(KrunGpuDevice* handle, int render_server_fd, KrunError* err_out);
 void krun_gpu_device_shm_size(KrunGpuDevice* handle, size_t size);
 typedef void (*krun_gpu_device_shm_size_fn)(KrunGpuDevice* handle, size_t size);
 void krun_gpu_device_destroy(KrunGpuDevice handle);

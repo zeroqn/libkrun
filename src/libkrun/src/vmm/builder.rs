@@ -93,7 +93,7 @@ use utils::eventfd::EventFd;
 use utils::worker_message::RECLAIM_BLOCK_SIZE;
 use utils::worker_message::WorkerMessage;
 use vm_memory::Bytes;
-#[cfg(all(feature = "vhost-user", target_os = "linux"))]
+#[cfg(all(any(feature = "vhost-user", feature = "gpu"), target_os = "linux"))]
 use vm_memory::FileOffset;
 #[cfg(feature = "tdx")]
 use vm_memory::GuestMemoryRegion;
@@ -824,6 +824,7 @@ pub fn build_microvm(
     let use_vhost_user = requirements.iter().any(|r| r.process_shareable_memory);
     #[cfg(target_os = "macos")]
     let ram_in_blocks = requirements.iter().any(|r| r.replaces_guest_ram);
+    let use_gpu_udmabuf = requirements.iter().any(|r| r.zero_copy_shm);
 
     #[cfg(feature = "tdx")]
     let td_shim_parsed = match &vm_resources.tee_firmware_config {
@@ -863,6 +864,7 @@ pub fn build_microvm(
                 &fs_shm_sizes,
                 gpu_shm_size,
                 use_vhost_user,
+                use_gpu_udmabuf,
                 &payload,
                 #[cfg(target_os = "macos")]
                 ram_in_blocks,
@@ -2068,6 +2070,7 @@ pub fn create_guest_memory(
     fs_shm_sizes: &[Option<usize>],
     gpu_shm_size: Option<usize>,
     use_vhost_user: bool,
+    use_gpu_udmabuf: bool,
     payload: &Payload,
     #[cfg(target_os = "macos")] ram_in_blocks: bool,
     #[cfg(feature = "tee")] firmware_range: Option<(u64, usize)>,
@@ -2160,15 +2163,16 @@ pub fn create_guest_memory(
     let _ = gpu_shm_size;
 
     let _ = use_vhost_user;
+    let _ = use_gpu_udmabuf;
 
     // Add SHM regions before creating guest memory
     arch_mem_regions.extend(shm_manager.regions());
 
-    let guest_mem = if use_vhost_user {
-        #[cfg(all(feature = "vhost-user", target_os = "linux"))]
+    let guest_mem = if use_vhost_user || use_gpu_udmabuf {
+        #[cfg(all(any(feature = "vhost-user", feature = "gpu"), target_os = "linux"))]
         {
             debug!(
-                "Creating file-backed memory for vhost-user (regions: {})",
+                "Creating file-backed memory for gpu or vhost-user (regions: {})",
                 arch_mem_regions.len()
             );
             // Create file-backed memory regions using memfd
@@ -2181,8 +2185,16 @@ pub fn create_guest_memory(
                     );
                     // SAFETY: memfd_create is called with a valid null-terminated C string and valid flags.
                     // File descriptor ownership is transferred to File::from_raw_fd below.
+                    // udmabuf only imports a memfd sealed against resizing
+                    // (SEALS_WANTED is F_SEAL_SHRINK), so the zero-copy path
+                    // seals; vhost-user keeps its unsealed regions.
+                    let memfd_flags = if use_gpu_udmabuf {
+                        libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING
+                    } else {
+                        libc::MFD_CLOEXEC
+                    };
                     let memfd = unsafe {
-                        let fd = libc::memfd_create(c"guest_mem".as_ptr(), libc::MFD_CLOEXEC);
+                        let fd = libc::memfd_create(c"guest_mem".as_ptr(), memfd_flags);
                         if fd < 0 {
                             error!("Failed to create memfd: {:?}", io::Error::last_os_error());
                             return Err(io::Error::last_os_error());
@@ -2192,6 +2204,17 @@ pub fn create_guest_memory(
                                 "Failed to ftruncate memfd: {:?}",
                                 io::Error::last_os_error()
                             );
+                            libc::close(fd);
+                            return Err(io::Error::last_os_error());
+                        }
+                        if use_gpu_udmabuf
+                            && libc::fcntl(
+                                fd,
+                                libc::F_ADD_SEALS,
+                                libc::F_SEAL_GROW | libc::F_SEAL_SHRINK,
+                            ) < 0
+                        {
+                            error!("Failed to seal memfd: {:?}", io::Error::last_os_error());
                             libc::close(fd);
                             return Err(io::Error::last_os_error());
                         }
@@ -2214,7 +2237,7 @@ pub fn create_guest_memory(
             GuestMemoryMmap::from_ranges_with_files(&regions_with_files)
                 .map_err(|e| StartMicrovmError::GuestMemoryMmap(format!("{e:?}")))?
         }
-        #[cfg(not(all(feature = "vhost-user", target_os = "linux")))]
+        #[cfg(not(all(any(feature = "vhost-user", feature = "gpu"), target_os = "linux")))]
         unreachable!()
     } else {
         GuestMemoryMmap::from_ranges(&arch_mem_regions)
@@ -2798,6 +2821,7 @@ pub mod tests {
             None,
             &[],
             None,
+            false,
             false,
             &Payload::Empty,
             #[cfg(target_os = "macos")]

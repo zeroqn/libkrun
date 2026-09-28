@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::env;
 use std::io::IoSliceMut;
+use std::os::fd::{IntoRawFd, OwnedFd};
 #[cfg(target_os = "linux")]
 use std::os::unix::io::{AsFd, AsRawFd};
 use std::path::PathBuf;
@@ -35,7 +36,8 @@ use rutabaga_gfx::{
 use rutabaga_gfx::{
     RUTABAGA_MAP_CACHE_MASK, RUTABAGA_PATH_TYPE_WAYLAND, ResourceCreate3D, ResourceCreateBlob,
     Rutabaga, RutabagaBuilder, RutabagaDescriptor, RutabagaFence, RutabagaFenceHandler,
-    RutabagaIovec, RutabagaPath, RutabagaResult, Transfer3D, VirtioFsLookup,
+    RutabagaFromRawDescriptor, RutabagaIovec, RutabagaPath, RutabagaResult, Transfer3D,
+    VirtioFsLookup,
 };
 #[cfg(target_os = "macos")]
 use utils::worker_message::WorkerMessage;
@@ -207,8 +209,11 @@ impl VirtioGpu {
                 completed_fence.fence_id, completed_fence.ring_idx
             );
 
-            let mut queue = queue_ctl.lock().unwrap();
-            let mut fence_state = fence_state.lock().unwrap();
+            // This runs inside virglrenderer's C callbacks, which are wrapped in
+            // catch_unwind(...).unwrap_or_else(|_| abort()): a poisoned mutex would
+            // panic there and abort the whole VM process, so recover the lock.
+            let mut queue = queue_ctl.lock().unwrap_or_else(|e| e.into_inner());
+            let mut fence_state = fence_state.lock().unwrap_or_else(|e| e.into_inner());
             let mut i = 0;
 
             let ring = match completed_fence.flags & VIRTIO_GPU_FLAG_INFO_RING_IDX {
@@ -257,6 +262,7 @@ impl VirtioGpu {
         interrupt: InterruptTransport,
         fence_state: Arc<Mutex<FenceState>>,
         virgl_flags: u32,
+        render_server_fd: Option<OwnedFd>,
         export_table: Option<ExportTable>,
     ) -> Option<Rutabaga> {
         let xdg_runtime_dir = match env::var("XDG_RUNTIME_DIR") {
@@ -320,6 +326,15 @@ impl VirtioGpu {
             builder = builder.set_virtiofs_lookup(lookup);
         }
 
+        if let Some(render_server_fd) = render_server_fd {
+            // SAFETY: we own the fd (moved in from the
+            // `krun_gpu_device_set_render_server_fd` ABI); virglrenderer takes
+            // ownership of the descriptor on a successful build.
+            let descriptor =
+                unsafe { RutabagaDescriptor::from_raw_descriptor(render_server_fd.into_raw_fd()) };
+            builder = builder.set_server_descriptor(Some(descriptor));
+        }
+
         builder.build().ok()
     }
 
@@ -347,6 +362,7 @@ impl VirtioGpu {
         queue_ctl: Arc<Mutex<VirtQueue>>,
         interrupt: InterruptTransport,
         virgl_flags: u32,
+        render_server_fd: Option<OwnedFd>,
         #[cfg(target_os = "macos")] map_sender: Sender<WorkerMessage>,
         export_table: Option<ExportTable>,
         displays: Box<[DisplayInfo]>,
@@ -360,6 +376,7 @@ impl VirtioGpu {
             interrupt.clone(),
             fence_state.clone(),
             virgl_flags,
+            render_server_fd,
             export_table.clone(),
         ) {
             Some(rutabaga) => rutabaga,
@@ -733,6 +750,31 @@ impl VirtioGpu {
     pub fn create_fence(&mut self, rutabaga_fence: RutabagaFence) -> VirtioGpuResult {
         self.rutabaga.create_fence(rutabaga_fence)?;
         Ok(OkNoData)
+    }
+
+    /// Retires completed fences through the rutabaga component (virglrenderer)
+    /// and signals the guest. Must be called whenever `poll_descriptor()` is
+    /// signaled and on every fence-poll timeout while a fence is pending.
+    pub fn event_poll(&mut self) {
+        self.rutabaga.event_poll();
+    }
+
+    /// A pollable descriptor that is signaled when there are fences to retire.
+    /// `None` when the component cannot poll (e.g. no virglrenderer).
+    pub fn poll_descriptor(&self) -> Option<RutabagaDescriptor> {
+        self.rutabaga.poll_descriptor()
+    }
+
+    /// True while at least one fenced descriptor still awaits retirement. When
+    /// false the worker may block indefinitely on the poll eventfd instead of
+    /// waking every 10ms on an idle VM.
+    pub fn has_pending_fence(&self) -> bool {
+        !self
+            .fence_state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .descs
+            .is_empty()
     }
 
     pub fn process_fence(

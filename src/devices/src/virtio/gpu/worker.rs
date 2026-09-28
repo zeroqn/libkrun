@@ -12,6 +12,8 @@ use rutabaga_gfx::{
     RUTABAGA_PIPE_BIND_RENDER_TARGET, RUTABAGA_PIPE_TEXTURE_2D, ResourceCreate3D,
     ResourceCreateBlob, RutabagaFence, Transfer3D,
 };
+#[cfg(target_os = "linux")]
+use utils::linux::udmabuf::UdmabufDriver;
 #[cfg(target_os = "macos")]
 use utils::worker_message::WorkerMessage;
 use vm_memory::{GuestAddress, GuestMemoryMmap};
@@ -38,6 +40,8 @@ pub struct Worker {
     shm_region: VirtioShmRegion,
     virgl_flags: u32,
     render_server_fd: Option<OwnedFd>,
+    #[cfg(target_os = "linux")]
+    udmabuf_driver: Option<UdmabufDriver>,
     #[cfg(target_os = "macos")]
     map_sender: Sender<WorkerMessage>,
     export_table: Option<ExportTable>,
@@ -54,6 +58,7 @@ impl Worker {
         shm_region: VirtioShmRegion,
         virgl_flags: u32,
         render_server_fd: Option<OwnedFd>,
+        #[cfg(target_os = "linux")] udmabuf_driver: Option<UdmabufDriver>,
         #[cfg(target_os = "macos")] map_sender: Sender<WorkerMessage>,
         export_table: Option<ExportTable>,
         displays: Box<[DisplayInfo]>,
@@ -75,6 +80,8 @@ impl Worker {
             shm_region,
             virgl_flags,
             render_server_fd,
+            #[cfg(target_os = "linux")]
+            udmabuf_driver,
             #[cfg(target_os = "macos")]
             map_sender,
             export_table,
@@ -97,6 +104,8 @@ impl Worker {
             self.interrupt.clone(),
             self.virgl_flags,
             self.render_server_fd.take(),
+            #[cfg(target_os = "linux")]
+            self.udmabuf_driver.take(),
             #[cfg(target_os = "macos")]
             self.map_sender.clone(),
             self.export_table.take(),

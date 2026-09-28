@@ -41,6 +41,8 @@ use vm_memory::{Address, GuestMemoryBackend};
 
 use super::error::VmmError;
 use super::export_bitflags;
+#[cfg(target_os = "linux")]
+use utils::linux::udmabuf::UdmabufDriver;
 
 /// Requirements a device declares before the VM's memory layout is fixed.
 /// `#[non_exhaustive]` allows adding new fields in minor releases.
@@ -55,6 +57,9 @@ pub struct DeviceRequirements {
     pub gpu_shm: Option<usize>,
     /// Whether this device needs process-shareable memory (vhost-user).
     pub process_shareable_memory: bool,
+    /// Whether this device needs guest RAM file-backed so guest pages can be
+    /// exported as a host handle (the udmabuf zero-copy SHM path).
+    pub zero_copy_shm: bool,
 }
 
 /// Context provided to devices during attachment.
@@ -1638,6 +1643,8 @@ export_bitflags! {
 pub struct GpuDevice {
     virgl_flags: u32,
     render_server_fd: Option<OwnedFd>,
+    #[cfg(target_os = "linux")]
+    udmabuf_driver: Option<UdmabufDriver>,
     backend: DisplayBackend,
     shm_size: usize,
 }
@@ -1651,6 +1658,8 @@ impl GpuDevice {
         Self {
             virgl_flags: virgl_flags.bits(),
             render_server_fd: None,
+            #[cfg(target_os = "linux")]
+            udmabuf_driver: None,
             backend,
             shm_size: Self::DEFAULT_SHM_SIZE,
         }
@@ -1676,6 +1685,32 @@ impl GpuDevice {
         self.shm_size = size;
         self
     }
+
+    /// Ask for the zero-copy SHM fast path (cang's `--zero-copy-shm`).
+    ///
+    /// The probe lives here on purpose: opening `/dev/udmabuf` is the same
+    /// question as "can this host serve a guest handle", so probing once makes
+    /// withholding `VIRTIO_GPU_F_CREATE_GUEST_HANDLE` and keeping guest RAM
+    /// anonymous (`requirements().zero_copy_shm == false`, which
+    /// `create_guest_memory` reads) one decision rather than two that can
+    /// disagree. A host that cannot serve it keeps the copy path with a
+    /// warning, rather than negotiating a feature it cannot honour.
+    #[cfg_attr(feature = "ffi", ffier::export(cfg = "feature = \"gpu\""))]
+    #[cfg_attr(not(feature = "ffi"), cfg(feature = "gpu"))]
+    #[cfg(target_os = "linux")]
+    pub fn set_zero_copy_shm(mut self, enable: bool) -> Self {
+        if !enable {
+            return self;
+        }
+        match UdmabufDriver::new() {
+            Ok(driver) => self.udmabuf_driver = Some(driver),
+            Err(err) => log::warn!(
+                "zero-copy shared memory requested but /dev/udmabuf is unusable ({err}); \
+                 running without it"
+            ),
+        }
+        self
+    }
 }
 
 #[cfg_attr(feature = "ffi", ffier::export(cfg = "feature = \"gpu\""))]
@@ -1685,17 +1720,21 @@ impl<'a> AttachDevice<'a> for GpuDevice {
     fn requirements(&self) -> DeviceRequirements {
         DeviceRequirements {
             gpu_shm: Some(self.shm_size),
+            #[cfg(target_os = "linux")]
+            zero_copy_shm: self.udmabuf_driver.is_some(),
             ..Default::default()
         }
     }
 
     #[cfg_attr(feature = "ffi", ffier(skip))]
-    fn attach(self: Box<Self>, ctx: &mut AttachContext) -> Result<(), VmmError> {
+    fn attach(mut self: Box<Self>, ctx: &mut AttachContext) -> Result<(), VmmError> {
         let displays: Box<[DisplayInfo]> = self.backend.displays.into_boxed_slice();
 
         let gpu = devices::virtio::Gpu::new(
             self.virgl_flags,
             self.render_server_fd,
+            #[cfg(target_os = "linux")]
+            self.udmabuf_driver.take(),
             displays,
             self.backend.inner,
             #[cfg(target_os = "macos")]

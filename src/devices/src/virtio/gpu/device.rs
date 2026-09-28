@@ -12,7 +12,7 @@ use super::super::{
 use super::defs;
 use super::defs::uapi;
 use super::defs::uapi::virtio_gpu_config;
-use super::virtio_gpu::virgl_flags_to_capsets;
+use super::virtio_gpu::device_capset_mask;
 use super::worker::Worker;
 use crate::display::DisplayInfo;
 use crate::virtio::InterruptTransport;
@@ -168,7 +168,8 @@ impl VirtioDevice for Gpu {
             events_read: 0,
             events_clear: 0,
             num_scanouts: self.displays.len() as u32,
-            num_capsets: virgl_flags_to_capsets(self.virgl_flags).count_ones(),
+            num_capsets: device_capset_mask(self.virgl_flags, self.render_server_fd.is_some())
+                .count_ones(),
         };
 
         let config_slice = config.as_slice();

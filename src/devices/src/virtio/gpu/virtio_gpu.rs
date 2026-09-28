@@ -31,7 +31,8 @@ use rutabaga_gfx::RUTABAGA_HANDLE_TYPE_MEM_SHM;
 #[cfg(target_os = "linux")]
 use rutabaga_gfx::{
     RUTABAGA_MAP_ACCESS_MASK, RUTABAGA_MAP_ACCESS_READ, RUTABAGA_MAP_ACCESS_RW,
-    RUTABAGA_MAP_ACCESS_WRITE, RUTABAGA_PATH_TYPE_PIPEWIRE, RUTABAGA_PATH_TYPE_X11,
+    RUTABAGA_MAP_ACCESS_WRITE, RUTABAGA_PATH_TYPE_GPU, RUTABAGA_PATH_TYPE_PIPEWIRE,
+    RUTABAGA_PATH_TYPE_X11,
 };
 use rutabaga_gfx::{
     RUTABAGA_MAP_CACHE_MASK, RUTABAGA_PATH_TYPE_WAYLAND, ResourceCreate3D, ResourceCreateBlob,
@@ -56,6 +57,46 @@ const VIRGLRENDERER_VENUS: u32 = 1 << 6;
 const VIRGLRENDERER_NO_VIRGL: u32 = 1 << 7;
 const VIRGLRENDERER_RENDER_SERVER: u32 = 1 << 9;
 const VIRGLRENDERER_DRM: u32 = 1 << 10;
+
+/// The host DRM render node virglrenderer should use for the in-process (non
+/// render-server) GL winsys and for VA-API video (`vaGetDisplayDRM`).
+///
+/// rutabaga hands this path to virglrenderer as a "GPU path" and opens it again
+/// on every `get_drm_fd` callback, so probe for a node that actually opens
+/// read-write: Mesa's virtio-gpu vdrm driver mmaps its shmem buffer with
+/// `PROT_WRITE`, which the kernel rejects with `EACCES` on an `O_RDONLY`
+/// render-node fd and makes `vaInitialize` fail with
+/// `VA_STATUS_ERROR_ALLOCATION_FAILED`. Enumerating `/dev/dri` instead of
+/// probing a fixed `renderD128..131` range keeps this working when render-node
+/// indices depend on kernel probe order.
+#[cfg(target_os = "linux")]
+fn first_usable_render_node(dri_dir: &std::path::Path) -> Option<PathBuf> {
+    let entries = std::fs::read_dir(dri_dir).ok()?;
+    let mut nodes: Vec<PathBuf> = entries
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("renderD"))
+        })
+        .collect();
+    nodes.sort();
+
+    nodes.into_iter().find(|path| {
+        match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+        {
+            Ok(_) => true,
+            Err(err) => {
+                warn!("cannot open DRM render node {}: {err}", path.display());
+                false
+            }
+        }
+    })
+}
 
 struct ExportTableLookup {
     table: ExportTable,
@@ -305,10 +346,30 @@ impl VirtioGpu {
             });
         }
 
+        // virglrenderer's vrend winsys and libva's `vaGetDisplayDRM` ask rutabaga
+        // for a DRM fd through the `get_drm_fd` callback, and rutabaga opens the
+        // first path registered with the "GPU" type. With no such path the
+        // callback answers -1, virglrenderer fails with "failed to initialize drm
+        // renderer" and rutabaga degrades the whole backend to 2D - venus too,
+        // which is the Vulkan ICD the guest needs. The render server owns its own
+        // node over the server descriptor, so this is the in-process client path.
+        #[cfg(target_os = "linux")]
+        if virgl_flags & VIRGLRENDERER_DRM != 0 {
+            match first_usable_render_node(std::path::Path::new("/dev/dri")) {
+                Some(path) => rutabaga_paths.push(RutabagaPath {
+                    path,
+                    path_type: RUTABAGA_PATH_TYPE_GPU,
+                }),
+                None => warn!(
+                    "no usable DRM render node under /dev/dri: vrend winsys and VA-API video stay disabled"
+                ),
+            }
+        }
+
         let fence =
             Self::create_fence_handler(mem, queue_ctl.clone(), fence_state.clone(), interrupt);
 
-        let capset_mask: u64 = virgl_flags_to_capsets(virgl_flags);
+        let capset_mask: u64 = device_capset_mask(virgl_flags, render_server_fd.is_some());
 
         let use_egl = virgl_flags & VIRGLRENDERER_USE_EGL != 0;
         let use_gles = virgl_flags & VIRGLRENDERER_USE_GLES != 0;
@@ -1116,6 +1177,40 @@ fn checked_blob_map_addr(base: u64, offset: u64, size: u64, shm_size: u64) -> Op
 mod test {
     use crate::virtio::gpu::protocol::VIRTIO_GPU_MAX_SCANOUTS;
 
+    /// The DRM node rutabaga hands virglrenderer must be a render node that opens
+    /// read-write; control nodes and nodes whose open fails must be skipped.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn first_usable_render_node_skips_control_and_unopenable_nodes() {
+        use super::first_usable_render_node;
+        use std::fs;
+
+        let dir = std::env::temp_dir().join(format!(
+            "krun-render-node-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("create fixture dir");
+
+        // A control node is not a render node.
+        fs::write(dir.join("controlD64"), b"").expect("write control node");
+        assert_eq!(first_usable_render_node(&dir), None);
+
+        // Render nodes are picked in name order; a directory is never openable
+        // read-write (EISDIR), which is how an unusable node shows up here.
+        let node128 = dir.join("renderD128");
+        fs::write(&node128, b"").expect("write render node");
+        fs::create_dir(dir.join("renderD129")).expect("create unusable node");
+        assert_eq!(first_usable_render_node(&dir), Some(node128.clone()));
+
+        // With no openable render node left there is nothing to hand over.
+        fs::remove_file(&node128).expect("remove render node");
+        assert_eq!(first_usable_render_node(&dir), None);
+
+        fs::remove_dir_all(&dir).expect("remove fixture dir");
+    }
+
     #[test]
     fn checked_blob_map_addr_rejects_out_of_range_and_wrapping_offsets() {
         use super::checked_blob_map_addr;
@@ -1178,6 +1273,30 @@ mod test {
 
 /// Translate virglrenderer flags (which became part of the libkrun 1.x public API) to a rutabaga_gfx capset mask.
 /// Won't be necessary anymore when libkrun 2.x removes these from the API.
+/// The capset mask this device both advertises and builds rutabaga with.
+///
+/// The DRM native-context capset is an in-process rendering mode, and requesting
+/// it is fatal once a render server owns venus: rutabaga always enables
+/// ASYNC_FENCE_CB, virglrenderer reacts to ASYNC_FENCE_CB + DRM by probing the
+/// native DRM renderer (`drm_renderer_init`), and a probe that fails takes the
+/// *whole* backend down to 2D - venus included, so the guest never sees a capset
+/// and Chromium reports no WebGL. The DRM *fd* is still handed over (see
+/// `first_usable_render_node`): the vrend winsys and VA-API video use it, and
+/// neither reads the DRM flag.
+///
+/// `virtio_gpu_config.num_capsets` reports this mask's bit count, so the device
+/// config and rutabaga must agree on it: a guest that asks for an index rutabaga
+/// does not have never gets an answer and its capset enumeration times out.
+pub fn device_capset_mask(flags: u32, has_render_server: bool) -> u64 {
+    let mut capset_mask = virgl_flags_to_capsets(flags);
+
+    if has_render_server {
+        capset_mask &= !(1 << rutabaga_gfx::RUTABAGA_CAPSET_DRM);
+    }
+
+    capset_mask
+}
+
 pub fn virgl_flags_to_capsets(flags: u32) -> u64 {
     let mut capset_mask = 0;
 

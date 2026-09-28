@@ -17,6 +17,8 @@ use super::worker::Worker;
 use crate::display::DisplayInfo;
 use crate::virtio::InterruptTransport;
 use krun_display::DisplayBackend;
+#[cfg(target_os = "linux")]
+use utils::linux::udmabuf::UdmabufDriver;
 #[cfg(target_os = "macos")]
 use utils::worker_message::WorkerMessage;
 
@@ -39,6 +41,8 @@ pub struct Gpu {
     shm_region: Option<VirtioShmRegion>,
     virgl_flags: u32,
     render_server_fd: Option<OwnedFd>,
+    #[cfg(target_os = "linux")]
+    udmabuf_driver: Option<UdmabufDriver>,
     #[cfg(target_os = "macos")]
     map_sender: Sender<WorkerMessage>,
     export_table: Option<ExportTable>,
@@ -50,17 +54,39 @@ impl Gpu {
     pub fn new(
         virgl_flags: u32,
         render_server_fd: Option<OwnedFd>,
+        #[cfg(target_os = "linux")] udmabuf_driver: Option<UdmabufDriver>,
         displays: Box<[DisplayInfo]>,
         display_backend: DisplayBackend<'static>,
         #[cfg(target_os = "macos")] map_sender: Sender<WorkerMessage>,
     ) -> super::Result<Gpu> {
+        // The zero-copy SHM fast path needs both halves of the contract the
+        // guest kernel stamps a blob with: it only creates a host-side handle
+        // when it negotiated VIRTIO_GPU_F_CREATE_GUEST_HANDLE, and it only
+        // names a ctx_id for a guest-only blob when it negotiated
+        // VIRTIO_GPU_F_BLOB_CTX_ID_FIX. Advertise them together, and only when
+        // the udmabuf driver actually opened - a guest that took the flag
+        // against a host that cannot serve it would stop copying and render
+        // wrong pixels rather than fall back.
+        #[cfg(target_os = "linux")]
+        let avail_features = if udmabuf_driver.is_some() {
+            AVAIL_FEATURES
+                | (1u64 << uapi::VIRTIO_GPU_F_CREATE_GUEST_HANDLE)
+                | (1u64 << uapi::VIRTIO_GPU_F_BLOB_CTX_ID_FIX)
+        } else {
+            AVAIL_FEATURES
+        };
+        #[cfg(not(target_os = "linux"))]
+        let avail_features = AVAIL_FEATURES;
+
         Ok(Gpu {
-            avail_features: AVAIL_FEATURES,
+            avail_features,
             acked_features: 0,
             device_state: DeviceState::Inactive,
             shm_region: None,
             virgl_flags,
             render_server_fd,
+            #[cfg(target_os = "linux")]
+            udmabuf_driver,
             #[cfg(target_os = "macos")]
             map_sender,
             export_table: None,
@@ -220,6 +246,8 @@ impl VirtioDevice for Gpu {
             shm_region,
             self.virgl_flags,
             self.render_server_fd.take(),
+            #[cfg(target_os = "linux")]
+            self.udmabuf_driver.take(),
             #[cfg(target_os = "macos")]
             self.map_sender.clone(),
             self.export_table.take(),

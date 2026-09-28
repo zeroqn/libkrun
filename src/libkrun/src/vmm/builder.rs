@@ -32,6 +32,7 @@ use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
 #[cfg(target_os = "linux")]
 use super::VcpuRunState;
 use super::{Error, Vmm};
+use crate::vmm::profile::KrunProfiler;
 
 #[cfg(all(target_os = "linux", target_arch = "riscv64"))]
 use crate::api::{AttachContext, AttachDevice, RtcDevice};
@@ -775,8 +776,11 @@ pub fn build_microvm(
     _shutdown_efd: Option<EventFd>,
     _sender: Sender<WorkerMessage>,
     device_manager: Box<dyn crate::api::device_builders::DeviceManager<'_> + '_>,
+    profiler: Option<&KrunProfiler>,
 ) -> std::result::Result<Arc<Mutex<Vmm>>, StartMicrovmError> {
-    let payload = choose_payload(vm_resources)?;
+    let payload = measure_builder_phase(profiler, "libkrun_build_microvm_choose_payload", || {
+        choose_payload(vm_resources)
+    })?;
 
     #[cfg(all(
         target_arch = "x86_64",
@@ -845,27 +849,33 @@ pub fn build_microvm(
     let fw_range_for_mem: Option<(u64, usize)> = None;
 
     #[allow(unused_mut)]
-    let (guest_memory, mut arch_memory_info, _shm_manager, payload_config) = create_guest_memory(
-        vm_resources
-            .vm_config()
-            .mem_size_mib
-            .ok_or(StartMicrovmError::MissingMemSizeConfig)?,
-        vm_resources.kernel_bundle.as_ref(),
-        #[cfg(feature = "tee")]
-        vm_resources.qboot_bundle.as_ref(),
-        #[cfg(feature = "tee")]
-        vm_resources.initrd_bundle.as_ref(),
-        vm_resources.firmware_config.as_ref(),
-        &fs_shm_sizes,
-        gpu_shm_size,
-        use_vhost_user,
-        &payload,
-        #[cfg(target_os = "macos")]
-        ram_in_blocks,
-        #[cfg(target_os = "linux")]
-        vm_resources.transparent_huge_pages,
-        #[cfg(feature = "tee")]
-        fw_range_for_mem,
+    let (guest_memory, mut arch_memory_info, _shm_manager, payload_config) = measure_builder_phase(
+        profiler,
+        "libkrun_build_microvm_create_guest_memory",
+        || {
+            create_guest_memory(
+                vm_resources
+                    .vm_config()
+                    .mem_size_mib
+                    .ok_or(StartMicrovmError::MissingMemSizeConfig)?,
+                vm_resources.kernel_bundle.as_ref(),
+                #[cfg(feature = "tee")]
+                vm_resources.qboot_bundle.as_ref(),
+                #[cfg(feature = "tee")]
+                vm_resources.initrd_bundle.as_ref(),
+                vm_resources.firmware_config.as_ref(),
+                &fs_shm_sizes,
+                gpu_shm_size,
+                use_vhost_user,
+                &payload,
+                #[cfg(target_os = "macos")]
+                ram_in_blocks,
+                #[cfg(target_os = "linux")]
+                vm_resources.transparent_huge_pages,
+                #[cfg(feature = "tee")]
+                fw_range_for_mem,
+            )
+        },
     )?;
 
     let vcpu_config = vm_resources.vcpu_config();
@@ -1494,16 +1504,18 @@ pub fn build_microvm(
         setup_terminal_utf8_output(&mut vmm);
     }
 
-    device_manager
-        .attach_all(
-            &mut vmm,
-            event_manager,
-            &_shm_manager,
-            intc.clone(),
-            #[cfg(target_os = "macos")]
-            Some(_sender.clone()),
-        )
-        .map_err(|e| StartMicrovmError::AttachDevice(format!("{e:?}")))?;
+    measure_builder_phase(profiler, "libkrun_build_microvm_attach_devices", || {
+        device_manager
+            .attach_all(
+                &mut vmm,
+                event_manager,
+                &_shm_manager,
+                intc.clone(),
+                #[cfg(target_os = "macos")]
+                Some(_sender.clone()),
+            )
+            .map_err(|e| StartMicrovmError::AttachDevice(format!("{e:?}")))
+    })?;
 
     if let Some(s) = &vm_resources.kernel_cmdline.epilog {
         vmm.kernel_cmdline.insert_str(s).unwrap();
@@ -1626,18 +1638,37 @@ pub fn build_microvm(
         println!("Starting TEE/microVM.");
     }
 
-    vmm.start_vcpus(vcpus)
-        .map_err(StartMicrovmError::Internal)?;
+    measure_builder_phase(profiler, "libkrun_build_microvm_start_vcpus", || {
+        vmm.start_vcpus(vcpus).map_err(StartMicrovmError::Internal)
+    })?;
 
     // Clippy thinks we don't need Arc<Mutex<...
     // but we don't want to change the event_manager interface
     #[allow(clippy::arc_with_non_send_sync)]
     let vmm = Arc::new(Mutex::new(vmm));
-    event_manager
-        .add_subscriber(vmm.clone())
-        .map_err(StartMicrovmError::RegisterEvent)?;
+    measure_builder_phase(
+        profiler,
+        "libkrun_build_microvm_register_event_subscriber",
+        || {
+            event_manager
+                .add_subscriber(vmm.clone())
+                .map_err(StartMicrovmError::RegisterEvent)
+        },
+    )?;
 
     Ok(vmm)
+}
+
+/// Time `f` into the launch profile when profiling is on, otherwise run it plain.
+fn measure_builder_phase<T>(
+    profiler: Option<&KrunProfiler>,
+    label: &'static str,
+    f: impl FnOnce() -> T,
+) -> T {
+    match profiler {
+        Some(profiler) => profiler.measure(label, f),
+        None => f(),
+    }
 }
 
 #[cfg(not(target_os = "windows"))]

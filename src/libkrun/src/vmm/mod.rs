@@ -13,6 +13,8 @@
 /// Handles setup and initialization a `Vmm` object.
 pub mod builder;
 pub(crate) mod device_manager;
+/// Best-effort host-side profiling support.
+pub mod profile;
 /// Resource store for configured microVM resources.
 pub mod resources;
 /// Signal handling utilities.

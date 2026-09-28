@@ -23,24 +23,48 @@ have.
 ## Fork-only work
 
 Re-derived on the ABI-2 builder/object API, because the v1 entry points they used
-no longer exist upstream:
+no longer exist upstream. The C names are regenerated from the Rust API by
+`make gen-libkrun-bindings`, so they are `krun_<object>_<method>`:
 
-- Opt-in launch profiling for cang diagnosis: TSV records
-  `<label>\t<duration_nanos>`, best-effort and disabled unless a caller supplies a
-  profile path. Attributes time spent inside VMM construction before libkrun hands
-  control to the guest event loop, and allows appending kernel logging flags for
-  profiled launches only, leaving the default kernel command line unchanged.
-- The render-server fd entry point behind cang's `--gpu=drm` and `--wayland`
-  modes, reaching `RutabagaBuilder::set_server_descriptor`.
-- The virtio-gpu device fixes that came with the above: fence retirement (polling
-  the virgl eventfd and calling `event_poll`), blob-map overflow, DRM render-node
-  gating, and the idle poll.
+- `krun_vmm_builder_set_profile_path(VmmBuilder*, KrunStr, KrunError*)` - opt-in
+  launch profiling for cang diagnosis: TSV records `<label>\t<duration_nanos>`,
+  best-effort and disabled unless a caller supplies a profile path. Attributes
+  time spent inside VMM construction before libkrun hands control to the guest
+  event loop. Kernel logging flags for profiled launches are no longer part of
+  this ABI: cang appends them through the ABI-2
+  `krun_payload_append_cmdline`, which keeps the default kernel command line
+  unchanged for unprofiled launches.
+- `krun_gpu_device_set_render_server_fd(GpuDevice*, int, KrunError*)` - the
+  render-server fd entry point behind cang's `--gpu=drm` and `--wayland` modes.
+  It validates the fd, owns it, and reaches
+  `RutabagaBuilder::set_server_descriptor`, which is what virglrenderer's venus
+  render-server path uses. A negative fd is rejected.
+- The virtio-gpu device fixes that came with it: fence retirement (polling the
+  virgl eventfd, calling `event_poll` on timeout while a fence is pending),
+  poison-safe fence-handler locks, and the two-tier poll timeout that stops an
+  idle VM from waking every 10ms.
 
 The vaapi video work the branch used to carry (DRM render-node opened `O_RDWR`,
 `get_drm_fd` renderer callback) is **not** re-added: crates.io `rutabaga_gfx`
 0.1.85 already ships it (`src/virgl_renderer.rs` opens the render node
 read+write with `O_CLOEXEC|O_NONBLOCK|O_NOCTTY` and registers `get_drm_fd` as the
-renderer callback).
+renderer callback). Neither is the v1 `krun_set_kernel_cmdline_append`: ABI 2
+exposes the same capability as `krun_payload_append_cmdline`.
 
 Keep profiling opt-in and best-effort. If libkrun rejects a profile path or cannot
 write a row, normal VM startup behavior must remain unchanged.
+
+## Building this branch
+
+ABI 2 gates the whole C surface behind the `ffi` cargo feature, and the Makefile
+only enables it for `FFI=1`. Build with:
+
+```
+make BLK=1 NET=1 GPU=1 INPUT=1 TIMESYNC=1 FFI=1
+```
+
+`make install` then produces `libkrun.so.2*` (the VMM + the fork's extensions)
+and `libkrun_init.so.0*` (the guest init blob plus its config builder). A build
+without `FFI=1` still succeeds and ships a `libkrun.so.2` that exports no
+`krun_*` symbol at all, which is why `publish-cang-release.yml` now builds with
+`FFI=1` and asserts the exported symbols before packaging.

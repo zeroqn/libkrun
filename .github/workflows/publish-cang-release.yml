@@ -57,7 +57,10 @@ jobs:
           sccache --version
 
           make clean
-          make BLK=1 NET=1 GPU=1 INPUT=1 TIMESYNC=1
+          # ABI 2 puts the C entry points behind the `ffi` cargo feature: without
+          # FFI=1 the host library exports no `krun_*` symbol at all and the
+          # asset is unusable by any C consumer (the init blob always gets ffi).
+          make BLK=1 NET=1 GPU=1 INPUT=1 TIMESYNC=1 FFI=1
           make DESTDIR="$PWD/tmp" PREFIX=/usr install
 
           rm -rf pkgroot
@@ -75,6 +78,16 @@ jobs:
           # cang cannot boot without the init blob: upstream main moved the
           # guest init out of libkrun.so into libkrun_init.so.
           test -n "$(find pkgroot/lib64 -maxdepth 1 -name 'libkrun_init.so*' -print -quit)"
+          # Assert the exported ABI, not just the file: a build without FFI=1
+          # ships a libkrun.so that exists and does nothing.
+          for symbol in krun_init_log krun_vmm_builder_new krun_vmm_builder_build krun_vmm_run krun_gpu_device_new; do
+            nm -D --defined-only pkgroot/lib64/libkrun.so.2 | grep -q " T ${symbol}$" \
+              || { echo "error: libkrun.so.2 does not export ${symbol}" >&2; exit 1; }
+          done
+          for symbol in krun_init_config_builder krun_init_config_apply_in; do
+            nm -D --defined-only pkgroot/lib64/libkrun_init.so.0 | grep -q " T ${symbol}$" \
+              || { echo "error: libkrun_init.so.0 does not export ${symbol}" >&2; exit 1; }
+          done
 
           tar -C pkgroot -czf "${{ matrix.asset }}" lib64 include
           tar -tzf "${{ matrix.asset }}" | grep -Fx lib64/pkgconfig/libkrun.pc

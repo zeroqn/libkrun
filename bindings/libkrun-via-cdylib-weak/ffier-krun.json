@@ -2450,6 +2450,34 @@
             "type": "Self"
           },
           "ffi_name": "krun_gpu_device_shm_size"
+        },
+        {
+          "name": "set_zero_copy_shm",
+          "doc": [
+            " Ask for the zero-copy SHM fast path (cang's `--zero-copy-shm`).",
+            "",
+            " The probe lives here on purpose: opening `/dev/udmabuf` is the same",
+            " question as \"can this host serve a guest handle\", so probing once makes",
+            " withholding `VIRTIO_GPU_F_CREATE_GUEST_HANDLE` and keeping guest RAM",
+            " anonymous (`requirements().zero_copy_shm == false`, which",
+            " `create_guest_memory` reads) one decision rather than two that can",
+            " disagree. A host that cannot serve it keeps the copy path with a",
+            " warning, rather than negotiating a feature it cannot honour."
+          ],
+          "receiver": "value",
+          "params": [
+            {
+              "name": "enable",
+              "param_kind": "regular",
+              "type": "bool"
+            }
+          ],
+          "ret": {
+            "return_kind": "value",
+            "type": "Self"
+          },
+          "ffi_name": "krun_gpu_device_set_zero_copy_shm",
+          "cfg": "target_os = \"linux\""
         }
       ],
       "cfg": "feature = \"gpu\""

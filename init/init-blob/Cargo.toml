@@ -11,12 +11,12 @@ build = "build.rs"
 amd-sev = []
 tdx = []
 timesync = []
-ffi = ["ffi-client"]
+ffi = ["ffi-client", "dep:ffier"]
 direct = ["dep:krun"]
 ffi-client = ["dep:krun-via-cdylib-weak"]
 
 [dependencies]
-ffier = { git = "https://github.com/mtjhrc/ffier.git", tag = "0.2.0rc1" }
+ffier = { git = "https://github.com/mtjhrc/ffier.git", tag = "0.2.0rc1", optional = true }
 krun = { path = "../../src/libkrun", package = "libkrun", optional = true }
 krun-via-cdylib-weak = { path = "../../bindings/libkrun-via-cdylib-weak", optional = true }
 serde = { version = "1", features = ["derive"] }

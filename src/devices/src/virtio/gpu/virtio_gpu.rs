@@ -922,9 +922,23 @@ impl VirtioGpu {
             // zero-copy path, so creating the blob without the handle it asked
             // for would render wrong pixels with nothing to notice. An error
             // response makes the import fail where the guest can see it.
-            let udmabuf = driver.create_udmabuf(mem, &vecs).inspect_err(|err| {
-                warn!("Failed to create udmabuf for resource {resource_id}: {err}");
-            }).map_err(|_| ErrUnspec)?;
+            let udmabuf = driver
+                .create_udmabuf(mem, &vecs)
+                .inspect_err(|err| {
+                    // The guest has already committed to zero-copy here, so this
+                    // is the only place the shape of the failing request is
+                    // visible: the udmabuf driver's own limits (a per-dmabuf
+                    // size cap, page alignment, the memfd seal contract) are what
+                    // turn into a bare `EINVAL` at the ioctl.
+                    let bytes: usize = vecs.iter().map(|(_, len)| *len).sum();
+                    warn!(
+                        "Failed to create udmabuf for resource {resource_id}: {err} \
+                         (entries={}, bytes={bytes}, first={:?})",
+                        vecs.len(),
+                        vecs.first()
+                    );
+                })
+                .map_err(|_| ErrUnspec)?;
 
             handle = Some(RutabagaHandle::from(RutabagaMagmaHandle {
                 // SAFETY: udmabuf_create returned a fresh descriptor we own.

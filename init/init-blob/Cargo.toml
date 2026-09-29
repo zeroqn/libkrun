@@ -16,12 +16,13 @@ default = ["krun"]
 # in-tree consumer wants. It is implicit from the optional dependency, so
 # building the cdylib passes --no-default-features to leave it out.
 #
-# `ffi` replaces those types with the generated client. The linking mode of
-# that client is the final binary's choice, so nothing is selected here.
-ffi = ["dep:libkrun-via-libc"]
+# `ffi` replaces those types with the generated client, and pulls in the
+# `ffier` dependency that generates it. The linking mode of that client is the
+# final binary's choice, so nothing is selected here.
+ffi = ["dep:libkrun-via-libc", "dep:ffier"]
 
 [dependencies]
-ffier = { workspace = true }
+ffier = { workspace = true, optional = true }
 krun = { path = "../../src/libkrun", package = "libkrun", optional = true }
 libkrun-via-libc = { path = "../../bindings/libkrun-via-libc", optional = true }
 serde = { version = "1", features = ["derive"] }

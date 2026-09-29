@@ -38,11 +38,53 @@ pub enum UdmabufError {
 
     #[error("starting address or length not page aligned")]
     NotPageAligned,
+
+    #[error(
+        "udmabuf request needs {items} page runs but the driver accepts at most {limit} \
+         (fragmentation, not size: the guest hands one run per page)"
+    )]
+    TooFragmented { items: usize, limit: usize },
 }
 
 pub type Result<T> = std::result::Result<T, UdmabufError>;
 
 const UDMABUF_FLAGS_CLOEXEC: u32 = 1;
+
+/// The driver's `list_limit` module parameter, 1024 by default: a create request
+/// naming more runs than this is rejected with `EINVAL`.
+const UDMABUF_CREATE_LIST_LIMIT: usize = 1024;
+
+/// One `udmabuf_create_item`: a contiguous run of pages in one memfd.
+#[derive(Debug, Default, Copy, Clone, PartialEq, Eq)]
+struct UdmabufSegment {
+    memfd: i32,
+    offset: u64,
+    size: u64,
+}
+
+/// Merge runs that continue each other in the same memfd.
+///
+/// The guest names one dma-buf entry per page, so an 8 MiB `wl_shm` pool arrives
+/// as 2025 runs - over the driver's `list_limit` of 1024, and the ioctl then
+/// fails with a bare `EINVAL` *after* the guest has switched to its zero-copy
+/// path. Adjacent runs describe the same pages in the same order, so they are
+/// one item; non-adjacent or cross-memfd runs stay separate, and the order is
+/// preserved because it is the blob's page order.
+fn coalesce_segments(segments: Vec<UdmabufSegment>) -> Vec<UdmabufSegment> {
+    let mut merged: Vec<UdmabufSegment> = Vec::with_capacity(segments.len());
+    for segment in segments {
+        match merged.last_mut() {
+            Some(previous)
+                if previous.memfd == segment.memfd
+                    && previous.offset + previous.size == segment.offset =>
+            {
+                previous.size += segment.size;
+            }
+            _ => merged.push(segment),
+        }
+    }
+    merged
+}
 
 #[repr(C)]
 #[derive(Debug, Default, Copy, Clone)]
@@ -115,11 +157,7 @@ impl UdmabufDriver {
         mem: &GuestMemoryMmap,
         iovecs: &[(GuestAddress, usize)],
     ) -> Result<OwnedFd> {
-        let mut list = UdmabufCreateListWrapper::from_header(UdmabufCreateList {
-            flags: UDMABUF_FLAGS_CLOEXEC,
-            ..Default::default()
-        })
-        .map_err(UdmabufError::StructError)?;
+        let mut segments: Vec<UdmabufSegment> = Vec::with_capacity(iovecs.len());
         for &(addr, len) in iovecs.iter() {
             let region = mem.find_region(addr).ok_or(UdmabufError::RegionNotFound)?;
 
@@ -141,11 +179,32 @@ impl UdmabufDriver {
                 return Err(UdmabufError::NotPageAligned);
             }
 
-            list.push(UdmabufCreateItem {
+            segments.push(UdmabufSegment {
                 memfd: file_offset.file().as_raw_fd(),
-                __pad: 0,
                 offset,
                 size: len as u64,
+            });
+        }
+
+        let segments = coalesce_segments(segments);
+        if segments.len() > UDMABUF_CREATE_LIST_LIMIT {
+            return Err(UdmabufError::TooFragmented {
+                items: segments.len(),
+                limit: UDMABUF_CREATE_LIST_LIMIT,
+            });
+        }
+
+        let mut list = UdmabufCreateListWrapper::from_header(UdmabufCreateList {
+            flags: UDMABUF_FLAGS_CLOEXEC,
+            ..Default::default()
+        })
+        .map_err(UdmabufError::StructError)?;
+        for segment in segments {
+            list.push(UdmabufCreateItem {
+                memfd: segment.memfd,
+                __pad: 0,
+                offset: segment.offset,
+                size: segment.size,
             })
             .map_err(UdmabufError::StructError)?;
         }
@@ -159,5 +218,101 @@ impl UdmabufDriver {
         // SAFETY: a successful UDMABUF_CREATE returns a fresh file descriptor
         // owned by us.
         Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn page_runs(count: usize, memfd: i32) -> Vec<UdmabufSegment> {
+        (0..count)
+            .map(|index| UdmabufSegment {
+                memfd,
+                offset: (index * 4096) as u64,
+                size: 4096,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn coalescing_makes_one_item_of_a_contiguous_pool() {
+        // An 8 MiB wl_shm pool arrives as one run per page, which is what the
+        // driver's list_limit rejects.
+        let merged = coalesce_segments(page_runs(2025, 7));
+        assert_eq!(
+            merged,
+            [UdmabufSegment {
+                memfd: 7,
+                offset: 0,
+                size: 2025 * 4096
+            }]
+        );
+    }
+
+    #[test]
+    fn coalescing_keeps_gaps_and_other_memfds_separate() {
+        let segments = vec![
+            UdmabufSegment {
+                memfd: 7,
+                offset: 0,
+                size: 8192,
+            },
+            // Gap: a new item.
+            UdmabufSegment {
+                memfd: 7,
+                offset: 16384,
+                size: 4096,
+            },
+            // Same file offsets, different memfd: a new item.
+            UdmabufSegment {
+                memfd: 9,
+                offset: 20480,
+                size: 4096,
+            },
+            // Continues the second memfd's run.
+            UdmabufSegment {
+                memfd: 9,
+                offset: 24576,
+                size: 4096,
+            },
+        ];
+
+        assert_eq!(
+            coalesce_segments(segments),
+            [
+                UdmabufSegment {
+                    memfd: 7,
+                    offset: 0,
+                    size: 8192
+                },
+                UdmabufSegment {
+                    memfd: 7,
+                    offset: 16384,
+                    size: 4096
+                },
+                UdmabufSegment {
+                    memfd: 9,
+                    offset: 20480,
+                    size: 8192
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn coalescing_reports_fragmentation_over_the_driver_limit() {
+        // One page in, one page out: 2048 single-page runs cannot be expressed.
+        let mut segments = Vec::new();
+        for index in 0..2048u64 {
+            segments.push(UdmabufSegment {
+                memfd: 7,
+                offset: index * 8192,
+                size: 4096,
+            });
+        }
+        let merged = coalesce_segments(segments);
+        assert_eq!(merged.len(), 2048);
+        assert!(merged.len() > UDMABUF_CREATE_LIST_LIMIT);
     }
 }

@@ -56,6 +56,7 @@ const VIRGLRENDERER_VENUS: u32 = 1 << 6;
 const VIRGLRENDERER_NO_VIRGL: u32 = 1 << 7;
 const VIRGLRENDERER_RENDER_SERVER: u32 = 1 << 9;
 const VIRGLRENDERER_DRM: u32 = 1 << 10;
+const VIRGLRENDERER_USE_VIDEO: u32 = 1 << 11;
 
 /// The host DRM render node virglrenderer should use for the in-process (non
 /// render-server) GL winsys and for VA-API video (`vaGetDisplayDRM`).
@@ -382,13 +383,15 @@ impl VirtioGpu {
         let use_egl = virgl_flags & VIRGLRENDERER_USE_EGL != 0;
         let use_gles = virgl_flags & VIRGLRENDERER_USE_GLES != 0;
         let use_render_server = virgl_flags & VIRGLRENDERER_RENDER_SERVER != 0;
+        let use_video = virgl_flags & VIRGLRENDERER_USE_VIDEO != 0;
 
         let mut builder = RutabagaBuilder::new(capset_mask, fence)
             .set_default_component(rutabaga_gfx::RutabagaComponentType::VirglRenderer)
             .set_use_egl(use_egl)
             .set_use_gles(use_gles)
             .set_rutabaga_paths(Some(rutabaga_paths))
-            .set_use_render_server(use_render_server);
+            .set_use_render_server(use_render_server)
+            .set_use_video(use_video);
 
         if let Some(export_table) = export_table {
             let lookup: Arc<dyn VirtioFsLookup> = Arc::new(ExportTableLookup::new(export_table));

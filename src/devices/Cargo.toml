@@ -42,7 +42,7 @@ krun_input = { package = "krun-input", version = "0.1.0", path = "../input", fea
 arch = { package = "krun-arch", version = "=0.1.0-2.0.0-dev", path = "../arch" }
 utils = { package = "krun-utils", version = "=0.1.0-2.0.0-dev", path = "../utils" }
 polly = { package = "krun-polly", version = "=0.1.0-2.0.0-dev", path = "../polly" }
-rutabaga_gfx = { git = "https://github.com/magma-gpu/rutabaga_gfx", rev = "ec60ee117687414880590207067934d6aea24c35", features = ["virgl_renderer"], optional = true }
+rutabaga_gfx = { git = "https://github.com/zeroqn/rutabaga_gfx", rev = "d8479a1edb560228a55a4e6fd5817145c39e99d9", features = ["virgl_renderer"], optional = true }
 imago = { version = "0.2.4", default-features = false, features = ["sync", "vm-memory"] }
 
 [target.'cfg(unix)'.dependencies]
@@ -54,7 +54,7 @@ hvf = { package = "krun-hvf", version = "=0.1.0-2.0.0-dev", path = "../hvf" }
 lru = ">=0.9"
 
 [target.'cfg(target_os = "linux")'.dependencies]
-rutabaga_gfx = { git = "https://github.com/magma-gpu/rutabaga_gfx", rev = "ec60ee117687414880590207067934d6aea24c35", features = ["virgl_renderer"], optional = true }
+rutabaga_gfx = { git = "https://github.com/zeroqn/rutabaga_gfx", rev = "d8479a1edb560228a55a4e6fd5817145c39e99d9", features = ["virgl_renderer"], optional = true }
 caps = "0.5.5"
 kvm-bindings = { version = "0.14.1", features = ["fam-wrappers"] }
 kvm-ioctls = "0.25"

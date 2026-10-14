@@ -221,9 +221,8 @@ impl MuxerThread {
         self.create_listening_ipc_sockets();
         let mut epoll_events = vec![EpollEvent::new(EventSet::empty(), 0); 32];
         loop {
-            if self.drain_rxq() {
-                self.interrupt.signal_used_queue();
-            }
+            // EXP V2: drain the rxq but do not signal the used queue.
+            let _ = self.drain_rxq();
 
             match self
                 .epoll

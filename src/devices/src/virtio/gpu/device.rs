@@ -28,8 +28,7 @@ pub(crate) const AVAIL_FEATURES: u64 = (1u64 << uapi::VIRTIO_F_VERSION_1)
     | (1u64 << uapi::VIRTIO_GPU_F_EDID)
     | (1u64 << uapi::VIRTIO_GPU_F_RESOURCE_UUID)
     | (1u64 << uapi::VIRTIO_GPU_F_RESOURCE_BLOB)
-    | (1u64 << uapi::VIRTIO_GPU_F_CONTEXT_INIT)
-    | (1u64 << uapi::VIRTIO_GPU_F_BLOB_ALIGNMENT);
+    | (1u64 << uapi::VIRTIO_GPU_F_CONTEXT_INIT);
 
 const QUEUE_SIZE: u16 = 256;
 static QUEUE_CONFIG: [QueueConfig; defs::NUM_QUEUES] =

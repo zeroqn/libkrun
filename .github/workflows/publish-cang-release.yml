@@ -61,7 +61,12 @@ jobs:
           # FFI=1 the host library exports no `krun_*` symbol at all and the
           # asset is unusable by any C consumer (the init blob always gets ffi).
           make BLK=1 NET=1 GPU=1 INPUT=1 TIMESYNC=1 FFI=1
-          make DESTDIR="$PWD/tmp" PREFIX=/usr install
+          # Upstream derives LIBDIR_Linux from /etc/debian_version (493d707f),
+          # so on the Ubuntu runners `make install` writes tmp/usr/lib/<arch>-linux-gnu
+          # while this step packages lib64. A command-line assignment overrides
+          # the Makefile's shell probe, keeping the archive's lib64/ layout and
+          # the assertions below valid on both runner images.
+          make DESTDIR="$PWD/tmp" PREFIX=/usr LIBDIR_Linux=lib64 install
 
           rm -rf pkgroot
           mkdir -p pkgroot

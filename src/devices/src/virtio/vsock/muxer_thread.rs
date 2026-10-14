@@ -195,6 +195,9 @@ impl MuxerThread {
         self.create_listening_ipc_sockets();
         let mut epoll_events = vec![EpollEvent::new(EventSet::empty(), 0); 32];
         loop {
+            // EXP V3: spurious used-queue interrupt every iteration, no drain.
+            self.interrupt.signal_used_queue();
+
             match self
                 .epoll
                 .wait(epoll_events.len(), -1, epoll_events.as_mut_slice())

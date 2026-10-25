@@ -1,7 +1,8 @@
 # cang downstream libkrun branch
 
 Based on upstream `main` - the 2.0.0 / C-ABI-2 line - as of
-`a980e7795b86c8151e867b32a43af4cb984364fa` (2026-09-27). The previous base was
+`a1d8616765da03980f3be1bb8714bfdd3842f33c` (2026-10-16). The previous base was
+`a980e7795b86c8151e867b32a43af4cb984364fa`, and before the ABI-2 switch,
 upstream release `v1.19.5` (the `stable-1.19.x` line).
 
 ## Carried from upstream, still unmerged
@@ -10,7 +11,8 @@ Two open upstream PRs are cherry-picked on top of the base, each as its own
 commit with a `(cherry picked from upstream PR #N ...)` trailer so it can be
 dropped the day upstream merges it:
 
-- PR 865 - virtio/blk opt-in parallel reads
+- PR 865 - virtio/blk opt-in parallel reads with an auto-sized, overridable
+  read-pool (`krun_block_device_set_read_pool_size`)
 - PR 840 - guest-clock workarounds
 
 Upstream PR 822 (virtio-gpu `CREATE_GUEST_HANDLE`, the zero-copy SHM fast path)

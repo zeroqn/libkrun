@@ -1449,7 +1449,7 @@ impl BlockDevice {
     /// Create a new block device.
     ///
     /// Defaults to read-write (`read_only = false`), cached I/O (`direct_io = false`),
-    /// [`SyncMode::Relaxed`], and serialized reads (`parallel_reads = false`).
+    /// [`SyncMode::Relaxed`], and parallel reads (`parallel_reads = true`).
     pub fn new(id: &str, disk_image_path: &str, format: DiskFormat) -> Result<Self, VmmError> {
         Ok(Self {
             id: id.to_string(),
@@ -1458,7 +1458,7 @@ impl BlockDevice {
             is_read_only: false,
             direct_io: false,
             sync_mode: SyncMode::default(),
-            parallel_reads: false,
+            parallel_reads: true,
             read_pool_size: None,
         })
     }
@@ -1483,7 +1483,7 @@ impl BlockDevice {
 
     /// Serve guest reads on a host thread pool with out-of-order completion.
     ///
-    /// Disabled by default. Writes, flushes, and discards stay on the device thread.
+    /// Enabled by default. Writes, flushes, and discards stay on the device thread.
     /// The pool size is automatic unless overridden with [`set_read_pool_size`](Self::set_read_pool_size).
     pub fn set_parallel_reads(&mut self, enabled: bool) {
         self.parallel_reads = enabled;

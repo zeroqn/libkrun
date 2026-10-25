@@ -2017,6 +2017,46 @@ pub fn load_payload(
     }
 }
 
+/// Ask the host kernel to back the guest's RAM with 2 MiB pages.
+///
+/// Guest memory is a plain anonymous mapping (or a memfd mapping on the
+/// vhost-user and udmabuf zero-copy paths), and Linux defaults to
+/// `THP=madvise`, so without this advice every first guest touch costs a 4 KiB
+/// host page fault and the EPT holds 4 KiB entries. With it the kernel hands
+/// out 2 MiB pages - and maps them as 2 MiB EPT entries - wherever its policy
+/// allows. The advice is a hint: a `never` host policy, or a memfd-backed region
+/// while shmem THP is off, ignores it, so a failure is never fatal.
+#[cfg(target_os = "linux")]
+fn advise_hugepages_for_guest_memory(guest_mem: &GuestMemoryMmap) {
+    // `GuestMemoryRegion` (start_addr/len) is only imported for the tdx feature
+    // at module scope.
+    use vm_memory::GuestMemoryRegion;
+
+    for region in guest_mem.iter() {
+        let start = region.start_addr();
+        let Ok(host_addr) = guest_mem.get_host_address(start) else {
+            warn!("guest memory region at {start:?} has no host address");
+            continue;
+        };
+        // SAFETY: `host_addr`/`region.len()` describe the region's own live
+        // mapping, which outlives this call; madvise only changes its backing
+        // policy.
+        let ret = unsafe {
+            libc::madvise(
+                host_addr as *mut libc::c_void,
+                region.len() as usize,
+                libc::MADV_HUGEPAGE,
+            )
+        };
+        if ret < 0 {
+            warn!(
+                "guest memory at {start:?} could not be advised for huge pages: {:?}",
+                io::Error::last_os_error()
+            );
+        }
+    }
+}
+
 pub struct PayloadConfig {
     pub entry_addr: GuestAddress,
     pub initrd_config: Option<InitrdConfig>,
@@ -2248,6 +2288,9 @@ pub fn create_guest_memory(
     #[cfg(target_os = "macos")]
     let ram_in_blocks =
         ram_in_blocks && map_ram_in_blocks(&guest_mem, &arch_mem_info, map_guest_ram_in_blocks);
+
+    #[cfg(target_os = "linux")]
+    advise_hugepages_for_guest_memory(&guest_mem);
 
     let LoadedPayload {
         guest_mem,

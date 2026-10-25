@@ -11,8 +11,13 @@ Two open upstream PRs are cherry-picked on top of the base, each as its own
 commit with a `(cherry picked from upstream PR #N ...)` trailer so it can be
 dropped the day upstream merges it:
 
-- PR 865 - virtio/blk opt-in parallel reads with an auto-sized, overridable
-  read-pool (`krun_block_device_set_read_pool_size`)
+- PR 865 - virtio/blk parallel reads with an auto-sized, overridable read-pool
+  (`krun_block_device_set_read_pool_size`). The PR leaves the feature opt-in;
+  the fork turns it on by default (`parallel_reads = true` in
+  `BlockDevice::new`), so a caller that never touches the setter still gets the
+  thread pool. Because that default is a one-line fork commit, a caller that
+  must not depend on it - cang's `crates/cang-libkrun` does - can still set it
+  explicitly and survive the commit being dropped.
 - PR 840 - guest-clock workarounds
 
 Upstream PR 822 (virtio-gpu `CREATE_GUEST_HANDLE`, the zero-copy SHM fast path)

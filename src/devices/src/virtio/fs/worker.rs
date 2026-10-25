@@ -16,7 +16,7 @@ use utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
 use utils::eventfd::EventFd;
 use vm_memory::GuestMemoryMmap;
 
-use super::super::{FsError, Queue};
+use super::super::Queue;
 use super::augment_fs::AugmentFs;
 use super::defs::{HPQ_INDEX, REQ_INDEX};
 use super::descriptor_utils::{Reader, Writer};
@@ -215,18 +215,24 @@ impl FsWorker {
             error!("Failed to get queue event: {e:?}");
         }
 
+        // A guest-memory error while (un)masking notifications must not take
+        // the worker down: it is the only thread serving this share, so
+        // panicking would leave every later request unanswered forever.
         loop {
-            self.queues[queue_index]
-                .disable_notification(&self.mem)
-                .unwrap();
+            if let Err(e) = self.queues[queue_index].disable_notification(&self.mem) {
+                error!("failed to disable notifications on queue {queue_index}: {e}");
+                return;
+            }
 
             self.process_queue(queue_index);
 
-            if !self.queues[queue_index]
-                .enable_notification(&self.mem)
-                .unwrap()
-            {
-                break;
+            match self.queues[queue_index].enable_notification(&self.mem) {
+                Ok(true) => {}
+                Ok(false) => break,
+                Err(e) => {
+                    error!("failed to enable notifications on queue {queue_index}: {e}");
+                    return;
+                }
             }
         }
     }
@@ -234,34 +240,50 @@ impl FsWorker {
     fn process_queue(&mut self, queue_index: usize) {
         let queue = &mut self.queues[queue_index];
         while let Some(head) = queue.pop(&self.mem) {
-            let reader = Reader::new(&self.mem, head.clone())
-                .map_err(FsError::QueueReader)
-                .unwrap();
-            let writer = Writer::new(&self.mem, head.clone())
-                .map_err(FsError::QueueWriter)
-                .unwrap();
-
-            let len = match self.server.handle_message(
-                reader,
-                writer,
-                self.allow_idmap,
-                &self.shm_region,
-                &self.exit_code,
-                #[cfg(target_os = "macos")]
-                &self.map_sender,
-            ) {
-                Ok(len) => len,
+            // Descriptor chains come from the guest, so a malformed one is a
+            // protocol error for *that* request, not a reason to end the
+            // worker: complete it with a zero-length reply (the guest reports a
+            // fuse protocol error and retries) and keep serving the share.
+            let mut len = 0usize;
+            match Reader::new(&self.mem, head.clone()) {
+                Ok(reader) => match Writer::new(&self.mem, head.clone()) {
+                    Ok(writer) => {
+                        len = match self.server.handle_message(
+                            reader,
+                            writer,
+                            self.allow_idmap,
+                            &self.shm_region,
+                            &self.exit_code,
+                            #[cfg(target_os = "macos")]
+                            &self.map_sender,
+                        ) {
+                            Ok(len) => len,
+                            Err(e) => {
+                                error!("error handling message: {e:?}");
+                                0
+                            }
+                        };
+                    }
+                    Err(e) => {
+                        error!(
+                            "fs: failing request with unwritable descriptor chain {}: {e:?}",
+                            head.index
+                        );
+                    }
+                },
                 Err(e) => {
-                    error!("error handling message: {e:?}");
-                    0
+                    error!(
+                        "fs: failing request with unreadable descriptor chain {}: {e:?}",
+                        head.index
+                    );
                 }
-            };
+            }
 
             if let Err(e) = queue.add_used(&self.mem, head.index, len as u32) {
                 error!("failed to add used elements to the queue: {e:?}");
             }
 
-            if queue.needs_notification(&self.mem).unwrap() {
+            if queue.needs_notification(&self.mem).unwrap_or(true) {
                 self.interrupt.signal_used_queue();
             }
         }

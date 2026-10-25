@@ -50,7 +50,17 @@ no longer exist upstream. The C names are regenerated from the Rust API by
   virgl eventfd, calling `event_poll` on timeout while a fence is pending),
   poison-safe fence-handler locks, and the two-tier poll timeout that stops an
   idle VM from waking every 10ms.
-
+- Host huge pages behind guest RAM: `create_guest_memory` calls
+  `madvise(MADV_HUGEPAGE)` on every guest memory region before the payload and
+  the VM are set up. Guest RAM is a plain anonymous (or memfd-backed) mapping and
+  Linux defaults to `THP=madvise`, so without the advice every guest page gets a
+  4 KiB host page - one host page fault per first guest touch and 4 KiB EPT
+  entries. The advice is a hint: a `never` host policy, or a memfd region while
+  shmem THP is off, ignores it, and it is never fatal. Measured in cang with a
+  534-crate offline `cargo build` in the guest (three pairs, arm order
+  alternated): 79.7 s -> 65.8 s wall clock (-17%) with the host process's
+  `AnonHugePages` going 0 -> ~3.9 GiB at unchanged RSS. This one is plausibly
+  upstreamable; it is fork-only because cang needs it now.
 The vaapi video work the branch used to carry (DRM render-node opened `O_RDWR`,
 `get_drm_fd` renderer callback) is **not** re-added: crates.io `rutabaga_gfx`
 0.1.85 already ships it (`src/virgl_renderer.rs` opens the render node

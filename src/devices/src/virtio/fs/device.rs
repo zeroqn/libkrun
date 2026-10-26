@@ -60,6 +60,8 @@ pub struct Fs {
     /// single worker thread, exactly as virtiofs did before this device had a
     /// pool.
     worker_threads: usize,
+    /// Whether to report the served opcode mix when the device stops.
+    opcode_stats: bool,
     exit_code: Arc<AtomicI32>,
     #[cfg(target_os = "macos")]
     map_sender: Option<Sender<WorkerMessage>>,
@@ -111,6 +113,7 @@ impl Fs {
             worker_thread: None,
             worker_stopfd: EventFd::new(EFD_NONBLOCK).map_err(FsError::EventFd)?,
             worker_threads: DEFAULT_WORKER_THREADS,
+            opcode_stats: false,
             exit_code,
             #[cfg(target_os = "macos")]
             map_sender: None,
@@ -164,6 +167,38 @@ impl Fs {
     /// `DEFAULT_WORKER_THREADS`.
     pub fn set_worker_threads(&mut self, threads: usize) {
         self.worker_threads = threads.max(1);
+    }
+
+    /// Serve `FUSE_OPEN`/`FUSE_OPENDIR` with `-ENOSYS`, acknowledging
+    /// `FUSE_NO_OPEN_SUPPORT`/`FUSE_NO_OPENDIR_SUPPORT`.
+    ///
+    /// The client then stops sending those requests and completes the matching
+    /// releases itself (`fs/fuse/file.c:110-113`, `:139`, `:170-178`), which
+    /// removes two round trips from every file open and every directory open -
+    /// the largest request-removing lever the guest side has. What the handle
+    /// used to provide is served from a descriptor the server opens and caches
+    /// per *inode* on first use (`PassthroughFs::handle_of`), so the descriptor
+    /// lifetime moves from the open to the inode.
+    ///
+    /// Two consequences the device keeps in step with: `FUSE_ATOMIC_O_TRUNC`
+    /// stops being negotiated (truncate-on-open has no `FUSE_OPEN` to ride, so
+    /// the VFS truncates through `SETATTR` instead), and `CREATE` answers
+    /// without a handle (the kernel releases such a handle locally too, so one
+    /// returned here would never be released).
+    pub fn set_zero_message_open(&mut self, enabled: bool) {
+        if let Some(cfg) = self.passthrough_cfg.as_mut() {
+            cfg.zero_message_open = enabled;
+        }
+    }
+
+    /// Report the opcode mix served by this device when it stops.
+    ///
+    /// One relaxed increment per request on the serving path and one block of
+    /// log lines at teardown; the guest kernel this device serves cannot trace
+    /// fuse requests, so this is the only way to learn which opcodes a workload
+    /// actually issues.
+    pub fn set_opcode_stats(&mut self, enabled: bool) {
+        self.opcode_stats = enabled;
     }
 
     #[cfg(target_os = "macos")]
@@ -255,6 +290,7 @@ impl VirtioDevice for Fs {
             self.worker_stopfd.try_clone().unwrap(),
             self.exit_code.clone(),
             self.worker_threads,
+            self.opcode_stats,
             #[cfg(target_os = "macos")]
             self.map_sender.clone(),
         )

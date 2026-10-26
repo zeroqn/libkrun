@@ -13,7 +13,7 @@ use std::fs::File;
 use std::io::{self, Read, Write};
 use std::mem::size_of;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 
 use vm_memory::ByteValued;
 
@@ -68,17 +68,124 @@ impl io::Write for ZCWriter<'_> {
     }
 }
 
+/// How many opcode slots the per-device histogram keeps.
+///
+/// FUSE's opcode space is dense: the ones the kernel sends for this connection
+/// top out at `REMOVE_MAPPING` (49), so 64 covers every one of them with room to
+/// spare and one `u64` per slot is a few hundred bytes.
+pub const OPCODE_SLOTS: usize = 64;
+
 pub struct Server<F: FileSystem + Sync> {
     fs: F,
     options: AtomicU64,
+    /// Whether `open`/`opendir` answer `-ENOSYS` (zero-message open).
+    ///
+    /// Held here as well as in the file system because `FUSE_ATOMIC_O_TRUNC` has
+    /// to leave the `supported` set together with it: truncate-on-open rides the
+    /// `FUSE_OPEN` request when that flag is negotiated (`fs/fuse/file.c:34-35`,
+    /// `:257-295`), and a zero-message-open client sends no `FUSE_OPEN` - it
+    /// would open the file, keep the old contents, and never send the `SETATTR`
+    /// that would have truncated it, because the kernel believes the open did.
+    zero_message_open: AtomicBool,
+    /// Requests served per opcode.
+    ///
+    /// One relaxed increment per request, and the only way to learn the opcode
+    /// mix of a workload: the pinned guest kernel has neither ftrace nor debugfs
+    /// (`config-libkrunfw_x86_64-kvm-lto`), so the fuse tracepoints cannot be
+    /// used from inside the guest.
+    opcodes: [AtomicU64; OPCODE_SLOTS],
+    /// Requests served, i.e. the sum of `opcodes`.
+    served: AtomicU64,
+    /// Whether the histogram is reported while the device runs as well as at
+    /// teardown (off unless the caller asked: a launch that does not want to be
+    /// measured should not carry the lines).
+    stats: AtomicBool,
 }
+
+/// Request counts at which a running device reports its histogram.
+///
+/// The teardown report is the complete one, but it depends on the device being
+/// torn down in an orderly way - a killed VM may never get there. These give a
+/// progressively better answer in the log while the workload runs, at a cost of
+/// one comparison per request. A cang rustc-build arm serves ~1-3 M requests, so
+/// the interesting lines are the 1 M and 3 M ones.
+const OPCODE_MILESTONES: [u64; 9] = [
+    5_000,
+    20_000,
+    100_000,
+    300_000,
+    1_000_000,
+    3_000_000,
+    10_000_000,
+    30_000_000,
+    100_000_000,
+];
 
 impl<F: FileSystem + Sync> Server<F> {
     pub fn new(fs: F) -> Server<F> {
         Server {
             fs,
             options: AtomicU64::new(FsOptions::empty().bits()),
+            zero_message_open: AtomicBool::new(false),
+            opcodes: std::array::from_fn(|_| AtomicU64::new(0)),
+            served: AtomicU64::new(0),
+            stats: AtomicBool::new(false),
         }
+    }
+
+    /// Whether to report the histogram at request milestones as well as when the
+    /// device stops.
+    pub fn set_opcode_stats(&self, enabled: bool) {
+        self.stats.store(enabled, Ordering::Relaxed);
+    }
+
+    /// Serve `FUSE_OPEN`/`FUSE_OPENDIR` with `-ENOSYS`, and keep the negotiated
+    /// flags consistent with that (see the field's comment).
+    pub fn set_zero_message_open(&self, enabled: bool) {
+        self.zero_message_open.store(enabled, Ordering::Relaxed);
+    }
+
+    fn count_opcode(&self, opcode: u32) {
+        let slot = opcode as usize;
+        if slot < OPCODE_SLOTS {
+            self.opcodes[slot].fetch_add(1, Ordering::Relaxed);
+        }
+        let served = self.served.fetch_add(1, Ordering::Relaxed) + 1;
+        if self.stats.load(Ordering::Relaxed) && OPCODE_MILESTONES.contains(&served) {
+            self.log_opcode_histogram("milestone");
+        }
+    }
+
+    /// Log the opcode histogram: one header line, then one line per opcode, most
+    /// frequent first.
+    pub fn log_opcode_histogram(&self, tag: &str) {
+        let histogram = self.opcode_histogram();
+        let total: u64 = histogram.iter().map(|(_, count)| count).sum();
+        warn!("fs: opcode histogram [{tag}]: {total} requests served");
+        for (opcode, count) in histogram {
+            let share = if total == 0 {
+                0.0
+            } else {
+                (count as f64) * 100.0 / (total as f64)
+            };
+            match opcode_name(opcode) {
+                Some(name) => warn!("fs:   {name:<20} {count:>12} {share:>7.2}%"),
+                None => warn!("fs:   opcode {opcode:<13} {count:>12} {share:>7.2}%"),
+            }
+        }
+    }
+
+    /// The opcode histogram, most frequent first.
+    pub fn opcode_histogram(&self) -> Vec<(u32, u64)> {
+        let mut counts: Vec<(u32, u64)> = self
+            .opcodes
+            .iter()
+            .enumerate()
+            .map(|(opcode, count)| (opcode as u32, count.load(Ordering::Relaxed)))
+            .filter(|(_, count)| *count != 0)
+            .collect();
+        counts.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        counts
     }
 
     #[allow(clippy::cognitive_complexity)]
@@ -101,6 +208,7 @@ impl<F: FileSystem + Sync> Server<F> {
             );
         }
         debug!("opcode: {}", in_header.opcode);
+        self.count_opcode(in_header.opcode);
         match in_header.opcode {
             x if x == Opcode::Lookup as u32 => self.lookup(in_header, r, w),
             x if x == Opcode::Forget as u32 => self.forget(in_header, r), // No reply.
@@ -224,7 +332,10 @@ impl<F: FileSystem + Sync> Server<F> {
     fn getattr(&self, in_header: InHeader, mut r: Reader, w: Writer) -> Result<usize> {
         let GetattrIn { flags, fh, .. } = r.read_obj().map_err(Error::DecodeMessage)?;
 
-        let handle = if (flags & GETATTR_FH) != 0 {
+        // `fh == 0` means "no handle", not handle number zero: a zero-message
+        // open leaves `ff->fh` at 0 (`fs/fuse/file.c:154-156`) and the kernel
+        // still sets `FUSE_GETATTR_FH` for a file it has open (`fs/fuse/dir.c:1430-1435`).
+        let handle = if (flags & GETATTR_FH) != 0 && fh != 0 {
             Some(fh.into())
         } else {
             None
@@ -250,7 +361,13 @@ impl<F: FileSystem + Sync> Server<F> {
     fn setattr(&self, in_header: InHeader, mut r: Reader, w: Writer) -> Result<usize> {
         let setattr_in: SetattrIn = r.read_obj().map_err(Error::DecodeMessage)?;
 
-        let handle = if setattr_in.valid & FATTR_FH != 0 {
+        // As in `getattr`: with zero-message opens `FATTR_FH` can carry 0
+        // (`fs/fuse/dir.c:2210-2214`), and resolving that as a handle would fail
+        // every attribute change the guest makes through an open file -
+        // truncation included. No handle means the file system applies it to the
+        // inode's `O_PATH` descriptor, which is exactly what a zero-message-open
+        // request wants.
+        let handle = if setattr_in.valid & FATTR_FH != 0 && setattr_in.fh != 0 {
             Some(setattr_in.fh.into())
         } else {
             None
@@ -901,14 +1018,28 @@ impl<F: FileSystem + Sync> Server<F> {
             | FsOptions::AUTO_INVAL_DATA
             | FsOptions::ASYNC_DIO
             | FsOptions::HAS_IOCTL_DIR
-            | FsOptions::ATOMIC_O_TRUNC
             | FsOptions::MAX_PAGES
+            | FsOptions::ZERO_MESSAGE_OPEN
+            | FsOptions::ZERO_MESSAGE_OPENDIR
             | FsOptions::SUBMOUNTS
             | FsOptions::HANDLE_KILLPRIV_V2
             | FsOptions::INIT_EXT;
 
         if allow_idmap {
             supported |= FsOptions::ALLOW_IDMAP;
+        }
+
+        // Truncate-on-open rides the `FUSE_OPEN` request when this is negotiated:
+        // the kernel masks `O_TRUNC` into the open arguments, keeps its own size
+        // and page cache in step, and sends no `SETATTR` for it
+        // (`fs/fuse/file.c:34-35`, `:257-295`). A zero-message-open client sends
+        // no `FUSE_OPEN` at all, so negotiating the flag would make `O_TRUNC`
+        // open the file and leave its contents in place. Without it the VFS
+        // truncates through `SETATTR` size 0 after the open, which arrives with
+        // `fh == 0` and is served from the inode's descriptor: one round trip
+        // instead of the `OPEN` + `SETATTR` pair, and correct.
+        if !self.zero_message_open.load(Ordering::Relaxed) {
+            supported |= FsOptions::ATOMIC_O_TRUNC;
         }
 
         if cfg!(target_os = "macos") {
@@ -1678,4 +1809,63 @@ fn get_extensions(options: FsOptions, skip: usize, request_bytes: &[u8]) -> Resu
     }
 
     Ok(extensions)
+}
+
+/// The name of a FUSE opcode, for the device's histogram and diagnostics.
+///
+/// Only the opcodes this server handles by name are listed; anything else is
+/// reported numerically by the caller, so a miscount cannot hide behind a wrong
+/// label.
+pub fn opcode_name(opcode: u32) -> Option<&'static str> {
+    let name = match opcode {
+        x if x == Opcode::Lookup as u32 => "LOOKUP",
+        x if x == Opcode::Forget as u32 => "FORGET",
+        x if x == Opcode::Getattr as u32 => "GETATTR",
+        x if x == Opcode::Setattr as u32 => "SETATTR",
+        x if x == Opcode::Readlink as u32 => "READLINK",
+        x if x == Opcode::Symlink as u32 => "SYMLINK",
+        x if x == Opcode::Mknod as u32 => "MKNOD",
+        x if x == Opcode::Mkdir as u32 => "MKDIR",
+        x if x == Opcode::Unlink as u32 => "UNLINK",
+        x if x == Opcode::Rmdir as u32 => "RMDIR",
+        x if x == Opcode::Rename as u32 => "RENAME",
+        x if x == Opcode::Link as u32 => "LINK",
+        x if x == Opcode::Open as u32 => "OPEN",
+        x if x == Opcode::Read as u32 => "READ",
+        x if x == Opcode::Write as u32 => "WRITE",
+        x if x == Opcode::Statfs as u32 => "STATFS",
+        x if x == Opcode::Release as u32 => "RELEASE",
+        x if x == Opcode::Fsync as u32 => "FSYNC",
+        x if x == Opcode::Setxattr as u32 => "SETXATTR",
+        x if x == Opcode::Getxattr as u32 => "GETXATTR",
+        x if x == Opcode::Listxattr as u32 => "LISTXATTR",
+        x if x == Opcode::Removexattr as u32 => "REMOVEXATTR",
+        x if x == Opcode::Flush as u32 => "FLUSH",
+        x if x == Opcode::Init as u32 => "INIT",
+        x if x == Opcode::Opendir as u32 => "OPENDIR",
+        x if x == Opcode::Readdir as u32 => "READDIR",
+        x if x == Opcode::Releasedir as u32 => "RELEASEDIR",
+        x if x == Opcode::Fsyncdir as u32 => "FSYNCDIR",
+        x if x == Opcode::Getlk as u32 => "GETLK",
+        x if x == Opcode::Setlk as u32 => "SETLK",
+        x if x == Opcode::Setlkw as u32 => "SETLKW",
+        x if x == Opcode::Access as u32 => "ACCESS",
+        x if x == Opcode::Create as u32 => "CREATE",
+        x if x == Opcode::Interrupt as u32 => "INTERRUPT",
+        x if x == Opcode::Bmap as u32 => "BMAP",
+        x if x == Opcode::Destroy as u32 => "DESTROY",
+        x if x == Opcode::Ioctl as u32 => "IOCTL",
+        x if x == Opcode::Poll as u32 => "POLL",
+        x if x == Opcode::NotifyReply as u32 => "NOTIFY_REPLY",
+        x if x == Opcode::BatchForget as u32 => "BATCH_FORGET",
+        x if x == Opcode::Fallocate as u32 => "FALLOCATE",
+        x if x == Opcode::Readdirplus as u32 => "READDIRPLUS",
+        x if x == Opcode::Rename2 as u32 => "RENAME2",
+        x if x == Opcode::Lseek as u32 => "LSEEK",
+        x if x == Opcode::CopyFileRange as u32 => "COPY_FILE_RANGE",
+        x if x == Opcode::SetupMapping as u32 => "SETUPMAPPING",
+        x if x == Opcode::RemoveMapping as u32 => "REMOVEMAPPING",
+        _ => return None,
+    };
+    Some(name)
 }

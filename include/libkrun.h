@@ -269,6 +269,35 @@ typedef void (*krun_fs_device_set_dax_window_size_fn)(KrunFsDevice handle, uint6
  */
 void krun_fs_device_set_worker_threads(KrunFsDevice handle, size_t threads);
 typedef void (*krun_fs_device_set_worker_threads_fn)(KrunFsDevice handle, size_t threads);
+/**
+ * Serve `FUSE_OPEN`/`FUSE_OPENDIR` with `-ENOSYS`, acknowledging
+ * `FUSE_NO_OPEN_SUPPORT`/`FUSE_NO_OPENDIR_SUPPORT` (a "zero-message open").
+ *
+ * The client then stops sending those requests altogether and completes the
+ * matching releases itself, which removes two round trips from every file
+ * and every directory open. It matters because a FUSE round trip costs the
+ * same per request whatever the opcode, so the only large lever is issuing
+ * fewer of them. What the handle used to identify is served from a
+ * descriptor the server opens and caches per *inode* on first use, so the
+ * descriptor lifetime moves from the open to the inode.
+ *
+ * Two things move with it: `FUSE_ATOMIC_O_TRUNC` stops being negotiated (no
+ * `FUSE_OPEN` to carry `O_TRUNC`, so the VFS truncates through `SETATTR`),
+ * and `FUSE_CREATE` answers without a handle (the kernel releases such a
+ * handle locally too, so one returned here would never be released).
+ */
+void krun_fs_device_set_zero_message_open(KrunFsDevice handle, bool enabled);
+typedef void (*krun_fs_device_set_zero_message_open_fn)(KrunFsDevice handle, bool enabled);
+/**
+ * Report the opcode mix the device served when it stops.
+ *
+ * The guest kernel cannot trace fuse requests, so a histogram counted here
+ * is the only way to price a request-removing change against a real
+ * workload. One relaxed increment per request; one block of log lines at
+ * teardown.
+ */
+void krun_fs_device_set_opcode_stats(KrunFsDevice handle, bool enabled);
+typedef void (*krun_fs_device_set_opcode_stats_fn)(KrunFsDevice handle, bool enabled);
 void krun_fs_device_destroy(KrunFsDevice handle);
 typedef void (*krun_fs_device_destroy_fn)(KrunFsDevice handle);
 

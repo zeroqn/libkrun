@@ -74,6 +74,27 @@ no longer exist upstream. The C names are regenerated from the Rust API by
   bad request or a panicking handler from wedging the share applies to the pool,
   not just the single thread.
 
+- `krun_fs_device_set_zero_message_open(FsDevice*, bool)` - acknowledge
+  `FUSE_NO_OPEN_SUPPORT`/`FUSE_NO_OPENDIR_SUPPORT` by answering the first
+  `FUSE_OPEN`/`FUSE_OPENDIR` with `-ENOSYS`. The guest kernel then stops sending
+  them (`fs/fuse/file.c:139`, `:166-178`) and completes `FUSE_RELEASE` /
+  `FUSE_RELEASEDIR` itself (`:110-113`), which removes two round trips from every
+  file and directory open - the largest request-removing lever available on this
+  side, since a FUSE round trip costs about the same per request whatever the
+  opcode (cang's `docs/wayfinder/workspace-virtiofs-performance/notes/20` and
+  `23`). Requests then name only the inode (`ff->fh` stays 0), so
+  `PassthroughFs` opens and caches a descriptor per *inode* on first use
+  (`handle_of`) instead of per open; `FUSE_ATOMIC_O_TRUNC` is dropped from the
+  negotiated flags with it (no `FUSE_OPEN` to carry `O_TRUNC`, so the VFS
+  truncates through `SETATTR`), and `FUSE_CREATE` answers without a handle (the
+  kernel releases such a handle locally too, so one handed out would never be
+  released). Default off.
+- `krun_fs_device_set_opcode_stats(FsDevice*, bool)` - count served requests per
+  FUSE opcode and log the histogram when the device stops. The pinned guest
+  kernel has neither ftrace nor debugfs, so the server is the only place a
+  workload's opcode mix can be measured; it is what every request-removing lever
+  has to be priced against. Default off, one relaxed atomic increment when on.
+
 The vaapi video work the branch used to carry (DRM render-node opened `O_RDWR`,
 `get_drm_fd` renderer callback) is **not** re-added: crates.io `rutabaga_gfx`
 0.1.85 already ships it (`src/virgl_renderer.rs` opens the render node

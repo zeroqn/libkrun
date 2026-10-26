@@ -12,7 +12,7 @@ use std::mem::{self, MaybeUninit, size_of};
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use caps::{CapSet, Capability, has_cap};
@@ -50,6 +50,32 @@ struct InodeData {
     dev: u64,
     mnt_id: u64,
     refcount: AtomicU64,
+
+    /// The descriptors a `fh == 0` request is served from when the client
+    /// negotiated zero-message opens.
+    ///
+    /// Files and directories then have no per-open handle - the kernel never
+    /// sends `FUSE_OPEN`/`FUSE_OPENDIR` - so `READ`, `WRITE`, `READDIR`,
+    /// `FLUSH`, ... name only the inode, and the server keeps the descriptor
+    /// itself. It is opened lazily on first use and lives exactly as long as the
+    /// inode: `FORGET` removes the inode from `inodes`, and dropping this struct
+    /// closes what it holds.
+    zero_open: ZeroOpenFiles,
+}
+
+/// The lazily opened descriptors a zero-message-open inode serves requests from.
+///
+/// Two slots, because the access mode a request needs is not the one another
+/// request needed: a read must not force a writable descriptor on a file the
+/// caller may only read, and `FLUSH` on the last close of a read-only file must
+/// not fail because a writable open is not permitted. Both slots hold an
+/// `Arc<HandleData>` so a request resolves either kind of descriptor through the
+/// same `RwLock<File>` the old per-open handles used - which is also what
+/// serialises the `lseek` + `getdents64` pair a directory scan depends on.
+#[derive(Default)]
+struct ZeroOpenFiles {
+    read: Mutex<Option<Arc<HandleData>>>,
+    write: Mutex<Option<Arc<HandleData>>>,
 }
 
 struct HandleData {
@@ -163,6 +189,9 @@ pub fn drop_effective_cap(cap: Capability) -> io::Result<Option<ScopedCaps>> {
     ScopedCaps::new(cap)
 }
 
+static DBG_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static DBG_PROBES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn ebadf() -> io::Error {
     io::Error::from_raw_os_error(libc::EBADF)
 }
@@ -195,6 +224,64 @@ fn stat(f: &File) -> io::Result<libc::stat64> {
     }
 }
 
+/// Convert a `statx` buffer into the `stat64` the FUSE protocol carries plus the
+/// mount id, which is what the inode map is keyed on.
+fn statx_to_stat(stx: &libc::statx) -> (libc::stat64, u64) {
+    // Unfortunately, we cannot use an initializer to create the stat64 object,
+    // because it may contain padding and reserved fields (depending on the
+    // architecture), and it does not implement the Default trait.
+    // So we take a zeroed struct and set what we can. (Zero in all fields is
+    // wrong, but safe.)
+    let mut st = unsafe { MaybeUninit::<libc::stat64>::zeroed().assume_init() };
+
+    st.st_dev = libc::makedev(stx.stx_dev_major, stx.stx_dev_minor);
+    st.st_ino = stx.stx_ino;
+    st.st_mode = stx.stx_mode as _;
+    st.st_nlink = stx.stx_nlink as _;
+    st.st_uid = stx.stx_uid;
+    st.st_gid = stx.stx_gid;
+    st.st_rdev = libc::makedev(stx.stx_rdev_major, stx.stx_rdev_minor);
+    st.st_size = stx.stx_size as _;
+    st.st_blksize = stx.stx_blksize as _;
+    st.st_blocks = stx.stx_blocks as _;
+    st.st_atime = stx.stx_atime.tv_sec;
+    st.st_atime_nsec = stx.stx_atime.tv_nsec as _;
+    st.st_mtime = stx.stx_mtime.tv_sec;
+    st.st_mtime_nsec = stx.stx_mtime.tv_nsec as _;
+    st.st_ctime = stx.stx_ctime.tv_sec;
+    st.st_ctime_nsec = stx.stx_ctime.tv_nsec as _;
+    (st, stx.stx_mnt_id)
+}
+
+/// `statx` an entry of an already-open directory, without opening it.
+///
+/// This is the attributes half of what `lookup` does: one syscall that also
+/// yields the mount id, where materialising an `O_PATH` descriptor for the entry
+/// (which a *new* inode needs, and a known one does not) costs `openat` + `close`
+/// on top.
+fn statx_at(dirfd: libc::c_int, name: &CStr) -> io::Result<(libc::stat64, u64)> {
+    let mut stx = MaybeUninit::<libc::statx>::zeroed();
+
+    // Safe because the kernel will only write data in `stx` and we check the
+    // return value.
+    let res = unsafe {
+        libc::statx(
+            dirfd,
+            name.as_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+            libc::STATX_BASIC_STATS | libc::STATX_MNT_ID,
+            stx.as_mut_ptr(),
+        )
+    };
+    if res >= 0 {
+        // Safe because the kernel guarantees that the struct is now fully initialized.
+        let stx = unsafe { stx.assume_init() };
+        Ok(statx_to_stat(&stx))
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
 fn statx(f: &File) -> io::Result<(libc::stat64, u64)> {
     let mut stx = MaybeUninit::<libc::statx>::zeroed();
 
@@ -215,33 +302,29 @@ fn statx(f: &File) -> io::Result<(libc::stat64, u64)> {
     if res >= 0 {
         // Safe because the kernel guarantees that the struct is now fully initialized.
         let stx = unsafe { stx.assume_init() };
-
-        // Unfortunately, we cannot use an initializer to create the stat64 object,
-        // because it may contain padding and reserved fields (depending on the
-        // architecture), and it does not implement the Default trait.
-        // So we take a zeroed struct and set what we can. (Zero in all fields is
-        // wrong, but safe.)
-        let mut st = unsafe { MaybeUninit::<libc::stat64>::zeroed().assume_init() };
-
-        st.st_dev = libc::makedev(stx.stx_dev_major, stx.stx_dev_minor);
-        st.st_ino = stx.stx_ino;
-        st.st_mode = stx.stx_mode as _;
-        st.st_nlink = stx.stx_nlink as _;
-        st.st_uid = stx.stx_uid;
-        st.st_gid = stx.stx_gid;
-        st.st_rdev = libc::makedev(stx.stx_rdev_major, stx.stx_rdev_minor);
-        st.st_size = stx.stx_size as _;
-        st.st_blksize = stx.stx_blksize as _;
-        st.st_blocks = stx.stx_blocks as _;
-        st.st_atime = stx.stx_atime.tv_sec;
-        st.st_atime_nsec = stx.stx_atime.tv_nsec as _;
-        st.st_mtime = stx.stx_mtime.tv_sec;
-        st.st_mtime_nsec = stx.stx_mtime.tv_nsec as _;
-        st.st_ctime = stx.stx_ctime.tv_sec;
-        st.st_ctime_nsec = stx.stx_ctime.tv_nsec as _;
-        Ok((st, stx.stx_mnt_id))
+        Ok(statx_to_stat(&stx))
     } else {
         Err(io::Error::last_os_error())
+    }
+}
+
+/// The `FUSE_ATTR_SUBMOUNT` flag for an entry, given its attributes and mount
+/// id. A directory whose device or mount differs from its parent's is a mount
+/// point inside the shared tree, and the guest has to be told so it does not
+/// treat it as a plain directory of the parent's filesystem.
+fn submount_attr_flags(
+    announce_submounts: bool,
+    parent: &InodeData,
+    st: &libc::stat64,
+    mnt_id: u64,
+) -> u32 {
+    if st.st_mode & libc::S_IFMT == libc::S_IFDIR
+        && announce_submounts
+        && (st.st_dev != parent.dev || mnt_id != parent.mnt_id)
+    {
+        fuse::ATTR_SUBMOUNT
+    } else {
+        0
     }
 }
 
@@ -332,6 +415,19 @@ pub struct Config {
     /// The default value for this option is `false`.
     pub writeback: bool,
 
+    /// Whether to acknowledge `FUSE_NO_OPEN_SUPPORT`/`FUSE_NO_OPENDIR_SUPPORT`
+    /// by answering the first `FUSE_OPEN`/`FUSE_OPENDIR` with `-ENOSYS`.
+    ///
+    /// The kernel then stops sending those requests altogether
+    /// (`fs/fuse/file.c:166-177`) and completes `FUSE_RELEASE`/`FUSE_RELEASEDIR`
+    /// locally (`:110-113`), removing two round trips from every file open and
+    /// every directory open. The price is that requests arrive naming only the
+    /// inode (`ff->fh` stays 0, `:154-156`), so the server keeps a descriptor
+    /// per inode instead of per open - see `InodeData::zero_open`.
+    ///
+    /// The default value for this option is `false`.
+    pub zero_message_open: bool,
+
     /// The path of the root directory.
     ///
     /// The default is `/`.
@@ -369,6 +465,7 @@ impl Default for Config {
             attr_timeout: Duration::from_secs(5),
             cache_policy: Default::default(),
             writeback: false,
+            zero_message_open: false,
             root_dir: String::from("/"),
             xattr: true,
             proc_sfd_rawfd: None,
@@ -407,6 +504,9 @@ pub struct PassthroughFs {
     // `cfg.writeback` is true and `init` was called with `FsOptions::WRITEBACK_CACHE`.
     writeback: AtomicBool,
     announce_submounts: AtomicBool,
+    // Whether `open`/`opendir` answer `-ENOSYS`, so the client stops sending
+    // them and requests arrive naming only the inode (see `handle_of`).
+    zero_message_open: AtomicBool,
     my_uid: Option<libc::uid_t>,
     my_gid: Option<libc::gid_t>,
     cap_fowner: bool,
@@ -477,6 +577,7 @@ impl PassthroughFs {
 
             writeback: AtomicBool::new(false),
             announce_submounts: AtomicBool::new(false),
+            zero_message_open: AtomicBool::new(cfg.zero_message_open),
             my_uid,
             my_gid,
             cap_fowner,
@@ -534,6 +635,102 @@ impl PassthroughFs {
         Ok(unsafe { File::from_raw_fd(fd) })
     }
 
+    /// The descriptor a request naming `handle` should be served from.
+    ///
+    /// A client that negotiated zero-message opens has no per-open handle: the
+    /// kernel answers its own `open`/`opendir` from `ff->fh = 0` and sends
+    /// `READ`/`WRITE`/`READDIR`/... with `fh == 0` (`fs/fuse/file.c:154-156`,
+    /// `:184-187`). Such a request is served from a descriptor this server opens
+    /// for the *inode*, on first use, and caches on the inode for its lifetime -
+    /// moving the descriptor from the open to the inode is the whole cost of the
+    /// feature.
+    ///
+    /// `writable` picks the slot (see `ZeroOpenFiles`). `O_NONBLOCK` is added on
+    /// purpose: this open happens outside the guest's `open(2)`, so a FIFO in
+    /// the share would otherwise block the server thread with no request left
+    /// for the guest to interrupt. For a regular file the flag changes nothing.
+    fn handle_of(
+        &self,
+        inode: Inode,
+        handle: Handle,
+        writable: bool,
+    ) -> io::Result<Arc<HandleData>> {
+        if handle != 0 {
+            return self
+                .handles
+                .read()
+                .unwrap()
+                .get(&handle)
+                .filter(|hd| hd.inode == inode)
+                .cloned()
+                .ok_or_else(ebadf);
+        }
+
+        let data = self
+            .inodes
+            .read()
+            .unwrap()
+            .get(&inode)
+            .cloned()
+            .ok_or_else(ebadf)?;
+        let slot = if writable {
+            &data.zero_open.write
+        } else {
+            &data.zero_open.read
+        };
+        if let Some(handle) = slot.lock().unwrap().as_ref() {
+            return Ok(handle.clone());
+        }
+
+        let flags = if writable {
+            libc::O_WRONLY
+        } else {
+            libc::O_RDONLY
+        };
+        // A directory needs no extra flag to be scanned through the descriptor:
+        // `lseek64` + `getdents64` work on an `O_RDONLY` one.
+        let file = RwLock::new(self.open_inode(inode, flags | libc::O_NONBLOCK)?);
+        let opened = Arc::new(HandleData {
+            inode,
+            file,
+            exported: Default::default(),
+        });
+        // Two requests can race to open the same slot. The loser's descriptor is
+        // closed when its `Arc` drops and both then use the same one, so the
+        // cache stays single-entry without holding a lock across `openat`.
+        *slot.lock().unwrap() = Some(opened.clone());
+        Ok(opened)
+    }
+
+    /// The descriptor for a request that only needs *a* descriptor for the
+    /// inode (`FLUSH`, `FSYNC`, `LSEEK`): whichever slot is already open, else a
+    /// read-only one, else a writable one.
+    ///
+    /// `FLUSH` runs on the last close of a file the guest may only have read, so
+    /// opening a writable descriptor here would fail the close with `EACCES` for
+    /// no reason - and `dup` + `close`, which is all `FLUSH` does with the
+    /// descriptor, is the same operation whichever access mode it was opened
+    /// with.
+    fn any_handle_of(&self, inode: Inode, handle: Handle) -> io::Result<Arc<HandleData>> {
+        if handle != 0 {
+            return self.handle_of(inode, handle, false);
+        }
+        let data = self
+            .inodes
+            .read()
+            .unwrap()
+            .get(&inode)
+            .cloned()
+            .ok_or_else(ebadf)?;
+        for slot in [&data.zero_open.read, &data.zero_open.write] {
+            if let Some(handle) = slot.lock().unwrap().as_ref() {
+                return Ok(handle.clone());
+            }
+        }
+        self.handle_of(inode, 0, false)
+            .or_else(|_| self.handle_of(inode, 0, true))
+    }
+
     fn open_inode_or_path(&self, inode: Inode, flags: i32) -> io::Result<FileOrLink> {
         match self.open_inode(inode, flags) {
             Ok(a) => Ok(FileOrLink::File(a)),
@@ -572,14 +769,7 @@ impl PassthroughFs {
             return Ok(());
         }
 
-        let data = self
-            .handles
-            .read()
-            .unwrap()
-            .get(&handle)
-            .filter(|hd| hd.inode == inode)
-            .cloned()
-            .ok_or_else(ebadf)?;
+        let data = self.handle_of(inode, handle, false)?;
 
         let mut buf = vec![0; size as usize];
 
@@ -720,6 +910,13 @@ impl PassthroughFs {
     }
 
     fn do_release(&self, inode: Inode, handle: Handle) -> io::Result<()> {
+        // A zero-message-open client has no handle to release: the kernel
+        // completes `FUSE_RELEASE`/`FUSE_RELEASEDIR` itself. Accept such a
+        // request rather than failing one that carries no state; the inode's
+        // descriptors are closed by the inode, not by this.
+        if handle == 0 && self.zero_message_open.load(Ordering::Relaxed) {
+            return Ok(());
+        }
         let mut handles = self.handles.write().unwrap();
 
         if let btree_map::Entry::Occupied(e) = handles.entry(handle)
@@ -893,6 +1090,7 @@ impl FileSystem for PassthroughFs {
                 dev: st.st_dev,
                 mnt_id,
                 refcount: AtomicU64::new(2),
+                zero_open: ZeroOpenFiles::default(),
             }),
         );
 
@@ -945,6 +1143,54 @@ impl FileSystem for PassthroughFs {
             .cloned()
             .ok_or_else(ebadf)?;
 
+        // Fast path: a known inode needs no descriptor of its own, because the
+        // reply is built from attributes only, and one `statx(p.file, name)` has
+        // them. The general path below also opens and closes an `O_PATH` fd for
+        // the entry, which matters because `readdirplus` runs this once per
+        // directory entry: a 4096-entry scan of a directory whose inodes are
+        // already known is 4096 openat/statx/close triples, and this makes it
+        // 4096 statx calls.
+        //
+        // A miss - the first time an inode is seen - falls through to the
+        // original path and pays one extra syscall for the probe. That is once
+        // per inode, while every later scan of the same directory hits.
+        if let Ok((st, mnt_id)) = statx_at(p.file.as_raw_fd(), name) {
+            // TEMPORARY INSTRUMENTATION - not for commit
+            let probe = DBG_PROBES.fetch_add(1, Ordering::Relaxed);
+            let altkey = InodeAltKey {
+                ino: st.st_ino,
+                dev: st.st_dev,
+                mnt_id,
+            };
+            let known = self.inodes.read().unwrap().get_alt(&altkey).cloned();
+            if let Some(data) = known {
+                let n = DBG_HITS.fetch_add(1, Ordering::Relaxed);
+                if n % 200000 == 0 {
+                    error!(
+                        "fsdbg: cheap-lookup hits={} probes={} misses={}",
+                        n,
+                        probe,
+                        DBG_PROBES.load(Ordering::Relaxed) - DBG_HITS.load(Ordering::Relaxed)
+                    );
+                }
+                // Matches with the release store in `forget`.
+                data.refcount.fetch_add(1, Ordering::Acquire);
+                return Ok(Entry {
+                    inode: data.inode,
+                    generation: 0,
+                    attr: st,
+                    attr_flags: submount_attr_flags(
+                        self.announce_submounts.load(Ordering::Relaxed),
+                        &p,
+                        &st,
+                        mnt_id,
+                    ),
+                    attr_timeout: self.cfg.attr_timeout,
+                    entry_timeout: self.cfg.entry_timeout,
+                });
+            }
+        }
+
         // Safe because this doesn't modify any memory and we check the return value.
         let fd = unsafe {
             libc::openat(
@@ -962,14 +1208,12 @@ impl FileSystem for PassthroughFs {
 
         let (st, mnt_id) = statx(&f)?;
 
-        let mut attr_flags: u32 = 0;
-
-        if st.st_mode & libc::S_IFMT == libc::S_IFDIR
-            && self.announce_submounts.load(Ordering::Relaxed)
-            && (st.st_dev != p.dev || mnt_id != p.mnt_id)
-        {
-            attr_flags |= fuse::ATTR_SUBMOUNT;
-        }
+        let attr_flags = submount_attr_flags(
+            self.announce_submounts.load(Ordering::Relaxed),
+            &p,
+            &st,
+            mnt_id,
+        );
 
         let altkey = InodeAltKey {
             ino: st.st_ino,
@@ -1000,6 +1244,7 @@ impl FileSystem for PassthroughFs {
                     dev: st.st_dev,
                     mnt_id,
                     refcount: AtomicU64::new(1),
+                    zero_open: ZeroOpenFiles::default(),
                 }),
             );
 
@@ -1038,6 +1283,13 @@ impl FileSystem for PassthroughFs {
         inode: Inode,
         flags: u32,
     ) -> io::Result<(Option<Handle>, OpenOptions)> {
+        // As in `open`, for `FUSE_NO_OPENDIR_SUPPORT`: the kernel frees the
+        // open arguments (`fs/fuse/file.c:170-173`) and `FUSE_READDIRPLUS` then
+        // arrives with `fh == 0`, served from the inode's own directory
+        // descriptor.
+        if self.zero_message_open.load(Ordering::Relaxed) {
+            return Err(io::Error::from_raw_os_error(libc::ENOSYS));
+        }
         self.do_open(inode, false, flags | (libc::O_DIRECTORY as u32))
     }
 
@@ -1134,6 +1386,16 @@ impl FileSystem for PassthroughFs {
         kill_priv: bool,
         flags: u32,
     ) -> io::Result<(Option<Handle>, OpenOptions)> {
+        // Zero-message open: answering the *first* `FUSE_OPEN` with `-ENOSYS` is
+        // how the protocol grants `FUSE_NO_OPEN_SUPPORT`. The kernel then sets
+        // `fc->no_open` and never sends another - it skips the request entirely
+        // (`fs/fuse/file.c:139`, `:157`) and completes `FUSE_RELEASE` locally
+        // (`:112-113`), which is two round trips removed from every file
+        // open+close. What used the handle is served from the inode's own
+        // descriptor instead (`handle_of`).
+        if self.zero_message_open.load(Ordering::Relaxed) {
+            return Err(io::Error::from_raw_os_error(libc::ENOSYS));
+        }
         self.do_open(inode, kill_priv, flags)
     }
 
@@ -1200,6 +1462,23 @@ impl FileSystem for PassthroughFs {
 
         let entry = self.lookup(ctx, parent, name)?;
 
+        // With zero-message opens the kernel never sends `FUSE_RELEASE` again -
+        // `fuse_file_put` completes *every* release locally once `fc->no_open` is
+        // set, including the one for the handle a create reply handed out
+        // (`fs/fuse/file.c:110-113`). A handle returned here would be opened and
+        // never released: one leaked descriptor and one leaked map entry per
+        // created file. Answering with no handle puts a new file on the same
+        // inode-descriptor path as every other file.
+        if self.zero_message_open.load(Ordering::Relaxed) {
+            let mut opts = OpenOptions::empty();
+            match self.cfg.cache_policy {
+                CachePolicy::Never => opts |= OpenOptions::DIRECT_IO,
+                CachePolicy::Always => opts |= OpenOptions::KEEP_CACHE,
+                _ => {}
+            }
+            return Ok((entry, None, opts));
+        }
+
         let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
         let data = HandleData {
             inode: entry.inode,
@@ -1235,14 +1514,7 @@ impl FileSystem for PassthroughFs {
         _flags: u32,
     ) -> io::Result<usize> {
         debug!("read: {inode:?}");
-        let data = self
-            .handles
-            .read()
-            .unwrap()
-            .get(&handle)
-            .filter(|hd| hd.inode == inode)
-            .cloned()
-            .ok_or_else(ebadf)?;
+        let data = self.handle_of(inode, handle, false)?;
 
         // This is safe because write_from uses preadv64, so the underlying file descriptor
         // offset is not affected by this operation.
@@ -1272,14 +1544,7 @@ impl FileSystem for PassthroughFs {
             None
         };
 
-        let data = self
-            .handles
-            .read()
-            .unwrap()
-            .get(&handle)
-            .filter(|hd| hd.inode == inode)
-            .cloned()
-            .ok_or_else(ebadf)?;
+        let data = self.handle_of(inode, handle, true)?;
 
         // This is safe because read_to uses pwritev64, so the underlying file descriptor
         // offset is not affected by this operation.
@@ -1635,14 +1900,11 @@ impl FileSystem for PassthroughFs {
         handle: Handle,
         _lock_owner: u64,
     ) -> io::Result<()> {
-        let data = self
-            .handles
-            .read()
-            .unwrap()
-            .get(&handle)
-            .filter(|hd| hd.inode == inode)
-            .cloned()
-            .ok_or_else(ebadf)?;
+        // `FUSE_FLUSH` still arrives on the last close of every file when opens
+        // are zero-message (`fs/fuse/file.c:491-506`); it is what carries the
+        // close's error back to the guest, so it has to keep working with no
+        // per-open handle.
+        let data = self.any_handle_of(inode, handle)?;
 
         // Since this method is called whenever an fd is closed in the client, we can emulate that
         // behavior by doing the same thing (dup-ing the fd and then immediately closing it). Safe
@@ -1662,14 +1924,7 @@ impl FileSystem for PassthroughFs {
     }
 
     fn fsync(&self, _ctx: Context, inode: Inode, datasync: bool, handle: Handle) -> io::Result<()> {
-        let data = self
-            .handles
-            .read()
-            .unwrap()
-            .get(&handle)
-            .filter(|hd| hd.inode == inode)
-            .cloned()
-            .ok_or_else(ebadf)?;
+        let data = self.any_handle_of(inode, handle)?;
 
         let fd = data.file.write().unwrap().as_raw_fd();
 
@@ -1933,14 +2188,7 @@ impl FileSystem for PassthroughFs {
         offset: u64,
         length: u64,
     ) -> io::Result<()> {
-        let data = self
-            .handles
-            .read()
-            .unwrap()
-            .get(&handle)
-            .filter(|hd| hd.inode == inode)
-            .cloned()
-            .ok_or_else(ebadf)?;
+        let data = self.handle_of(inode, handle, true)?;
 
         let fd = data.file.write().unwrap().as_raw_fd();
         // Safe because this doesn't modify any memory and we check the return value.
@@ -1967,14 +2215,7 @@ impl FileSystem for PassthroughFs {
         offset: u64,
         whence: u32,
     ) -> io::Result<u64> {
-        let data = self
-            .handles
-            .read()
-            .unwrap()
-            .get(&handle)
-            .filter(|hd| hd.inode == inode)
-            .cloned()
-            .ok_or_else(ebadf)?;
+        let data = self.any_handle_of(inode, handle)?;
 
         let fd = data.file.write().unwrap().as_raw_fd();
 
@@ -1999,26 +2240,12 @@ impl FileSystem for PassthroughFs {
         len: u64,
         flags: u64,
     ) -> io::Result<usize> {
-        let data_in = self
-            .handles
-            .read()
-            .unwrap()
-            .get(&handle_in)
-            .filter(|hd| hd.inode == inode_in)
-            .cloned()
-            .ok_or_else(ebadf)?;
+        let data_in = self.handle_of(inode_in, handle_in, false)?;
 
         // Take just a read lock as we're not going to alter the file descriptor offset.
         let fd_in = data_in.file.read().unwrap().as_raw_fd();
 
-        let data_out = self
-            .handles
-            .read()
-            .unwrap()
-            .get(&handle_out)
-            .filter(|hd| hd.inode == inode_out)
-            .cloned()
-            .ok_or_else(ebadf)?;
+        let data_out = self.handle_of(inode_out, handle_out, true)?;
 
         // Take just a read lock as we're not going to alter the file descriptor offset.
         let fd_out = data_out.file.read().unwrap().as_raw_fd();

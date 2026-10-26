@@ -214,6 +214,37 @@ enum FsServer {
 }
 
 impl FsServer {
+    /// Turn on zero-message opens (`FUSE_NO_OPEN_SUPPORT` /
+    /// `FUSE_NO_OPENDIR_SUPPORT`): `open`/`opendir` answer `-ENOSYS` and the
+    /// negotiated flag set is adjusted to match. See `Server::set_zero_message_open`.
+    fn set_zero_message_open(&self, enabled: bool) {
+        match self {
+            FsServer::ReadWrite(s) => s.set_zero_message_open(enabled),
+            FsServer::ReadOnly(s) => s.set_zero_message_open(enabled),
+            FsServer::Null(s) => s.set_zero_message_open(enabled),
+        }
+    }
+
+    /// Report the opcode mix served so far.
+    fn log_opcode_histogram(&self, tag: &str) {
+        match self {
+            FsServer::ReadWrite(s) => s.log_opcode_histogram(tag),
+            FsServer::ReadOnly(s) => s.log_opcode_histogram(tag),
+            FsServer::Null(s) => s.log_opcode_histogram(tag),
+        }
+    }
+
+    /// Whether the server reports its opcode histogram at request milestones.
+    fn set_opcode_stats(&self, enabled: bool) {
+        match self {
+            FsServer::ReadWrite(s) => s.set_opcode_stats(enabled),
+            FsServer::ReadOnly(s) => s.set_opcode_stats(enabled),
+            FsServer::Null(s) => s.set_opcode_stats(enabled),
+        }
+    }
+}
+
+impl FsServer {
     fn handle_message(
         &self,
         r: Reader,
@@ -328,6 +359,10 @@ pub struct FsWorker {
     stop_fd: EventFd,
     exit_code: Arc<AtomicI32>,
     worker_threads: usize,
+    /// Whether to report the served opcode mix when the device stops
+    /// (`CANG_FS_STATS` on the cang side). Off in a normal launch: the map that
+    /// wanted it has the numbers now, and a warning per VM is not worth a line.
+    opcode_stats: bool,
     pool: Option<FsPool>,
     #[cfg(target_os = "macos")]
     map_sender: Option<Sender<WorkerMessage>>,
@@ -348,9 +383,13 @@ impl FsWorker {
         stop_fd: EventFd,
         exit_code: Arc<AtomicI32>,
         worker_threads: usize,
+        opcode_stats: bool,
         #[cfg(target_os = "macos")] map_sender: Option<Sender<WorkerMessage>>,
     ) -> Result<Self, io::Error> {
         let inode_alloc = Arc::new(InodeAllocator::new());
+        let zero_message_open = passthrough_cfg
+            .as_ref()
+            .is_some_and(|cfg| cfg.zero_message_open);
         let server = match passthrough_cfg {
             Some(cfg) if read_only => {
                 let inner = PassthroughFsRo::new(cfg, inode_alloc.clone())?;
@@ -374,6 +413,8 @@ impl FsWorker {
                 virtual_entries,
             ))),
         };
+        server.set_zero_message_open(zero_message_open);
+        server.set_opcode_stats(opcode_stats);
         Ok(Self {
             queues,
             queue_evts,
@@ -385,6 +426,7 @@ impl FsWorker {
             stop_fd,
             exit_code,
             worker_threads: resolve_worker_threads(worker_threads),
+            opcode_stats,
             pool: None,
             #[cfg(target_os = "macos")]
             map_sender,
@@ -478,6 +520,7 @@ impl FsWorker {
                                 // threads are joined, so a stopping share does
                                 // not drop replies the guest could still use.
                                 self.handle_completions();
+                                self.log_opcode_histogram();
                                 return;
                             }
                             _ => {
@@ -493,6 +536,22 @@ impl FsWorker {
                 }
             }
         }
+    }
+
+    /// Report the opcode mix this device served, once, when it stops.
+    ///
+    /// The FUSE round trip turned out to cost the same per *request* whatever the
+    /// opcode (note 20/22 of the workspace-virtiofs-performance map), so which
+    /// opcodes a workload actually issues - and in what proportion - is what
+    /// every request-removing lever has to be priced against. The guest kernel
+    /// pinned for it has no ftrace and no debugfs, so the count can only come
+    /// from here. Emitted at `warn` because cang floors libkrun's log level
+    /// there: the line has to survive a default launch.
+    fn log_opcode_histogram(&self) {
+        if !self.opcode_stats {
+            return;
+        }
+        self.server.log_opcode_histogram("teardown");
     }
 
     fn handle_event(&mut self, queue_index: usize) {

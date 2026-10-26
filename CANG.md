@@ -61,6 +61,19 @@ no longer exist upstream. The C names are regenerated from the Rust API by
   alternated): 79.7 s -> 65.8 s wall clock (-17%) with the host process's
   `AnonHugePages` going 0 -> ~3.9 GiB at unchanged RSS. This one is plausibly
   upstreamable; it is fork-only because cang needs it now.
+- `krun_fs_device_set_worker_threads(FsDevice*, size_t)` - the size of the
+  pool that serves the virtio-fs request queue (1 = serve every request on the
+  device thread). virtio-fs has no multiqueue feature, so a single `fs worker`
+  thread serves the guest's whole root filesystem; one READDIRPLUS scan is
+  enough to saturate it while the guest is at 9-22% of a core, which is what a
+  pool behind the one queue fixes (see cang's
+  `docs/wayfinder/workspace-virtiofs-performance/notes/21-worker-pool-results.md`).
+  The device thread keeps the available and used rings; the pool threads run the
+  FUSE op and write the reply, so completions land out of order - allowed, the
+  FUSE client matches replies by `unique`. Default 4. The panic fix that keeps a
+  bad request or a panicking handler from wedging the share applies to the pool,
+  not just the single thread.
+
 The vaapi video work the branch used to carry (DRM render-node opened `O_RDWR`,
 `get_drm_fd` renderer callback) is **not** re-added: crates.io `rutabaga_gfx`
 0.1.85 already ships it (`src/virgl_renderer.rs` opens the render node

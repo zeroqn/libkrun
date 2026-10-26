@@ -664,6 +664,26 @@ impl<'a> FsDevice<'a> {
     pub fn set_dax_window_size(&mut self, bytes: u64) {
         self.shm_size = Some(bytes as usize);
     }
+
+    /// Set how many threads serve the virtiofs request queue.
+    ///
+    /// virtio-fs has no multiqueue feature: the guest driver maps a single
+    /// request queue however many vCPUs it has, so using more than one host core
+    /// means serving that queue's descriptors from a pool (as upstream
+    /// virtiofsd's `process_queue_pool` does). The device thread keeps reading
+    /// the available ring and publishing used-ring entries; the pool threads do
+    /// the FUSE work and write the replies. Replies complete out of order, which
+    /// the FUSE protocol allows: the client matches a reply to its request by
+    /// the header's `unique` field.
+    ///
+    /// Worth raising for workloads that scan large directories - one READDIRPLUS
+    /// thread is enough to saturate a single server thread - and close to free
+    /// for the small-file classes. `1` disables the pool and keeps every request
+    /// on the device thread; the value is clamped to the host's available
+    /// parallelism.
+    pub fn set_worker_threads(&mut self, threads: usize) {
+        self.inner.lock().unwrap().set_worker_threads(threads);
+    }
 }
 
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]

@@ -21,7 +21,7 @@ use super::super::{
 use super::ExportTable;
 use super::passthrough;
 use super::virtual_entry::VirtualDirEntry;
-use super::worker::FsWorker;
+use super::worker::{DEFAULT_WORKER_THREADS, FsWorker};
 use super::{defs, defs::uapi};
 use crate::virtio::InterruptTransport;
 use crate::virtio::passthrough::PermissionSemantics;
@@ -56,6 +56,10 @@ pub struct Fs {
     virtual_entries: Vec<VirtualDirEntry<'static>>,
     worker_thread: Option<JoinHandle<()>>,
     worker_stopfd: EventFd,
+    /// How many threads serve the request queue. 1 keeps every request on the
+    /// single worker thread, exactly as virtiofs did before this device had a
+    /// pool.
+    worker_threads: usize,
     exit_code: Arc<AtomicI32>,
     #[cfg(target_os = "macos")]
     map_sender: Option<Sender<WorkerMessage>>,
@@ -106,6 +110,7 @@ impl Fs {
             virtual_entries,
             worker_thread: None,
             worker_stopfd: EventFd::new(EFD_NONBLOCK).map_err(FsError::EventFd)?,
+            worker_threads: DEFAULT_WORKER_THREADS,
             exit_code,
             #[cfg(target_os = "macos")]
             map_sender: None,
@@ -141,6 +146,24 @@ impl Fs {
 
     pub fn set_exit_code(&mut self, exit_code: Arc<AtomicI32>) {
         self.exit_code = exit_code;
+    }
+
+    /// Set how many threads serve the virtio-fs request queue.
+    ///
+    /// virtio-fs has no multiqueue feature, so this is a pool behind the single
+    /// request queue (as upstream virtiofsd's `process_queue_pool` is): the
+    /// device thread keeps reading the available ring and publishing used-ring
+    /// entries, the pool threads do the FUSE work and write the replies. It is
+    /// worth it only for the class where one server thread saturates - a
+    /// directory scan (`READDIRPLUS`), where each entry costs an
+    /// `openat(O_PATH)+statx` on the host - and costs nothing measurable for
+    /// the small-file classes.
+    ///
+    /// `1` disables the pool and serves every request on the device thread; the
+    /// value is also clamped to the host's available parallelism. The default is
+    /// `DEFAULT_WORKER_THREADS`.
+    pub fn set_worker_threads(&mut self, threads: usize) {
+        self.worker_threads = threads.max(1);
     }
 
     #[cfg(target_os = "macos")]
@@ -231,6 +254,7 @@ impl VirtioDevice for Fs {
             virtual_entries,
             self.worker_stopfd.try_clone().unwrap(),
             self.exit_code.clone(),
+            self.worker_threads,
             #[cfg(target_os = "macos")]
             self.map_sender.clone(),
         )

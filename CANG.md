@@ -89,6 +89,31 @@ no longer exist upstream. The C names are regenerated from the Rust API by
   truncates through `SETATTR`), and `FUSE_CREATE` answers without a handle (the
   kernel releases such a handle locally too, so one handed out would never be
   released). Default off.
+- `krun_fs_device_set_no_flush(FsDevice*, bool)` - answer `FUSE_FLUSH` with
+  `-ENOSYS`, the protocol's own "this server has no close-time work", so the
+  client stops sending it (`fs/fuse/file.c:505-507` sets `no_flush` and treats
+  it as success). The server's flush body is `dup()`+`close()` of the passthrough
+  descriptor and nothing else, so the only thing lost is the close's ability to
+  report a *deferred* host error; no lock state is lost either, because this
+  server negotiates neither `POSIX_LOCKS` nor `FLOCK_LOCKS`, so the client's
+  locks are local and `filp_flush` -> `locks_remove_posix` releases them whatever
+  `->flush` does. Worth 21% of the requests and ~10% of the wall time of a cold
+  2401-crate `cargo build` (cang's notes 33 and 35). Preferred over the
+  client-side `FOPEN_NOFLUSH` flag, which can only ride an `OPEN` reply (and
+  `OPEN` is answered `-ENOSYS` under zero-message opens) and which additionally
+  skips the client's own close-time writeback. Default off.
+- `krun_fs_device_set_negative_entry(FsDevice*, bool, uint64_t timeout_millis)` -
+  answer a lookup of a missing name with the *cacheable* negative entry
+  (`nodeid == 0` plus `entry_valid`) instead of `-ENOENT`, and let the client
+  cache it for the given time. `-ENOENT` is never cacheable (the kernel drops the
+  dentry immediately, `fs/fuse/dir.c`), so every repeated probe of a missing name
+  costs a round trip; 91% of the lookups in a cold `cargo build` are such misses.
+  Caching them removed 72% of the requests and 21% of the wall time (cang's
+  notes 34-35). The price is the timeout itself: a file the *host* creates stays
+  invisible to the client for up to that long, which is why cang asks for 250 ms
+  - a quarter second keeps 92% of the saving, because a compiler re-probes the
+  same name within milliseconds, and the measured invisibility was 74 ms.
+  `enabled = false` keeps `-ENOENT`. Default off.
 - `krun_fs_device_set_opcode_stats(FsDevice*, bool)` - count served requests per
   FUSE opcode and log the histogram when the device stops. The pinned guest
   kernel has neither ftrace nor debugfs, so the server is the only place a

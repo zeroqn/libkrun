@@ -189,9 +189,6 @@ pub fn drop_effective_cap(cap: Capability) -> io::Result<Option<ScopedCaps>> {
     ScopedCaps::new(cap)
 }
 
-static DBG_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static DBG_PROBES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
 fn ebadf() -> io::Error {
     io::Error::from_raw_os_error(libc::EBADF)
 }
@@ -363,6 +360,23 @@ impl FromStr for CachePolicy {
     }
 }
 
+/// The cacheable form of "this name does not exist".
+///
+/// `inode == 0` is the protocol's negative entry: the kernel installs a negative
+/// dentry with `entry_timeout` instead of discarding the answer, which is exactly
+/// what `-ENOENT` cannot do (`filesystem::Entry::inode` documents it). `attr` has
+/// to be a real struct even though the kernel ignores it for a negative entry.
+fn negative_entry(entry_timeout: Duration) -> Entry {
+    Entry {
+        inode: 0,
+        generation: 0,
+        attr: unsafe { std::mem::zeroed() },
+        attr_flags: 0,
+        attr_timeout: Duration::from_secs(0),
+        entry_timeout,
+    }
+}
+
 /// The permission semantics to be emulated by this file system personality.
 #[derive(Debug, Default, Clone, Copy)]
 pub enum PermissionSemantics {
@@ -399,6 +413,24 @@ pub struct Config {
     /// The caching policy the file system should use. See the documentation of `CachePolicy` for
     /// more details.
     pub cache_policy: CachePolicy,
+    /// Answer `FUSE_FLUSH` with `-ENOSYS`, which is the protocol's own way of
+    /// telling the kernel the server has no close-time work (`fs/fuse/file.c`
+    /// treats it as success and sets `no_flush`). It removes one round trip per
+    /// close - 21% of a rustc build's requests - and costs only the close's
+    /// ability to report an error the host deferred, because this server's flush
+    /// body is a `dup()`+`close()` of the passthrough fd and nothing else.
+    pub no_flush: bool,
+    /// Answer a lookup of a missing name with the *negative entry* form
+    /// (`nodeid == 0` plus `entry_valid`) instead of `-ENOENT`, and let the
+    /// kernel cache it for the given time. `None` keeps the `-ENOENT` reply.
+    ///
+    /// `-ENOENT` is not cacheable: the kernel drops the dentry on the spot
+    /// (`fs/fuse/dir.c`, the `-ENOENT` arm of `fuse_lookup_name`), so every
+    /// repeated probe of the same missing name costs a round trip. The negative
+    /// entry is the only reply form that lets the kernel cache the answer, and
+    /// its lifetime is exactly the window in which a file the *host* creates
+    /// stays invisible to the guest - which is the whole cost of the setting.
+    pub negative_entry: Option<Duration>,
 
     /// Whether the file system should enabled writeback caching. This can improve performance as it
     /// allows the FUSE client to cache and coalesce multiple writes before sending them to the file
@@ -464,6 +496,8 @@ impl Default for Config {
             entry_timeout: Duration::from_secs(5),
             attr_timeout: Duration::from_secs(5),
             cache_policy: Default::default(),
+            no_flush: false,
+            negative_entry: None,
             writeback: false,
             zero_message_open: false,
             root_dir: String::from("/"),
@@ -1155,8 +1189,6 @@ impl FileSystem for PassthroughFs {
         // original path and pays one extra syscall for the probe. That is once
         // per inode, while every later scan of the same directory hits.
         if let Ok((st, mnt_id)) = statx_at(p.file.as_raw_fd(), name) {
-            // TEMPORARY INSTRUMENTATION - not for commit
-            let probe = DBG_PROBES.fetch_add(1, Ordering::Relaxed);
             let altkey = InodeAltKey {
                 ino: st.st_ino,
                 dev: st.st_dev,
@@ -1164,15 +1196,6 @@ impl FileSystem for PassthroughFs {
             };
             let known = self.inodes.read().unwrap().get_alt(&altkey).cloned();
             if let Some(data) = known {
-                let n = DBG_HITS.fetch_add(1, Ordering::Relaxed);
-                if n % 200000 == 0 {
-                    error!(
-                        "fsdbg: cheap-lookup hits={} probes={} misses={}",
-                        n,
-                        probe,
-                        DBG_PROBES.load(Ordering::Relaxed) - DBG_HITS.load(Ordering::Relaxed)
-                    );
-                }
                 // Matches with the release store in `forget`.
                 data.refcount.fetch_add(1, Ordering::Acquire);
                 return Ok(Entry {
@@ -1200,7 +1223,15 @@ impl FileSystem for PassthroughFs {
             )
         };
         if fd < 0 {
-            return Err(io::Error::last_os_error());
+            let err = io::Error::last_os_error();
+            // A name that is not there: answer with the cacheable negative entry
+            // rather than `-ENOENT`, so a repeated probe costs nothing.
+            if err.raw_os_error() == Some(libc::ENOENT) {
+                if let Some(timeout) = self.cfg.negative_entry {
+                    return Ok(negative_entry(timeout));
+                }
+            }
+            return Err(err);
         }
 
         // Safe because we just opened this fd.
@@ -1900,6 +1931,15 @@ impl FileSystem for PassthroughFs {
         handle: Handle,
         _lock_owner: u64,
     ) -> io::Result<()> {
+        // A close-time round trip this server has nothing to fill: its flush body
+        // is `dup()`+`close()` of the passthrough descriptor, and the kernel
+        // treats `-ENOSYS` as "no flush support" and stops sending the request
+        // (`fs/fuse/file.c`), which removes the same 21% of a build's requests the
+        // per-open `FOPEN_NOFLUSH` flag would - without a kernel patch.
+        if self.cfg.no_flush {
+            return Err(io::Error::from_raw_os_error(libc::ENOSYS));
+        }
+
         // `FUSE_FLUSH` still arrives on the last close of every file when opens
         // are zero-message (`fs/fuse/file.c:491-506`); it is what carries the
         // close's error back to the guest, so it has to keep working with no

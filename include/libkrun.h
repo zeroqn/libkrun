@@ -289,6 +289,35 @@ typedef void (*krun_fs_device_set_worker_threads_fn)(KrunFsDevice handle, size_t
 void krun_fs_device_set_zero_message_open(KrunFsDevice handle, bool enabled);
 typedef void (*krun_fs_device_set_zero_message_open_fn)(KrunFsDevice handle, bool enabled);
 /**
+ * Answer `FUSE_FLUSH` with `-ENOSYS`, i.e. tell the client the server has no
+ * close-time work so it stops sending the request.
+ *
+ * Worth one round trip per close - 21% of the requests a cold `cargo build`
+ * issues - because the server's flush body is a `dup()`+`close()` of the
+ * passthrough descriptor and nothing else. What is given up is the close's
+ * ability to report a *deferred* host error; no lock state is lost, because
+ * this server negotiates neither `POSIX_LOCKS` nor `FLOCK_LOCKS`, so the
+ * client's locks live in its own kernel and `filp_flush` releases them
+ * regardless of what `->flush` does.
+ */
+void krun_fs_device_set_no_flush(KrunFsDevice handle, bool enabled);
+typedef void (*krun_fs_device_set_no_flush_fn)(KrunFsDevice handle, bool enabled);
+/**
+ * Answer a lookup of a missing name with a cacheable negative entry
+ * (`nodeid == 0` plus `entry_valid`) instead of `-ENOENT`, and let the client
+ * cache it for `timeout_millis`. `enabled = false` keeps `-ENOENT`.
+ *
+ * `-ENOENT` is not cacheable, so every repeated probe of the same missing name
+ * costs a round trip; a build spends most of its lookups that way (91% of them
+ * in a cold `cargo build`, where caching them removed 72% of the requests and
+ * 21% of the wall time). The price is exactly the timeout: a file the *host*
+ * creates stays invisible to the client for up to that long, which is why it is
+ * short - a quarter second keeps 92% of the saving, because a compiler
+ * re-probes the same name within milliseconds.
+ */
+void krun_fs_device_set_negative_entry(KrunFsDevice handle, bool enabled, uint64_t timeout_millis);
+typedef void (*krun_fs_device_set_negative_entry_fn)(KrunFsDevice handle, bool enabled, uint64_t timeout_millis);
+/**
  * Report the opcode mix the device served when it stops.
  *
  * The guest kernel cannot trace fuse requests, so a histogram counted here

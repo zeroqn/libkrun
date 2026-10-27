@@ -96,6 +96,16 @@ pub struct Server<F: FileSystem + Sync> {
     opcodes: [AtomicU64; OPCODE_SLOTS],
     /// Requests served, i.e. the sum of `opcodes`.
     served: AtomicU64,
+    /// `FUSE_LOOKUP` outcomes, split the way the timeout question needs them.
+    ///
+    /// A positive lookup is the server being asked for a name the guest had
+    /// cached and revalidated or lost; a negative one is the guest probing for a
+    /// name that does not exist. The two have opposite fixes - one is churn the
+    /// timeout cannot help, the other is exactly what `entry_timeout` governs -
+    /// and the opcode histogram cannot tell them apart.
+    lookup_positive: AtomicU64,
+    lookup_negative: AtomicU64,
+    lookup_error: AtomicU64,
     /// Whether the histogram is reported while the device runs as well as at
     /// teardown (off unless the caller asked: a launch that does not want to be
     /// measured should not carry the lines).
@@ -129,6 +139,9 @@ impl<F: FileSystem + Sync> Server<F> {
             zero_message_open: AtomicBool::new(false),
             opcodes: std::array::from_fn(|_| AtomicU64::new(0)),
             served: AtomicU64::new(0),
+            lookup_positive: AtomicU64::new(0),
+            lookup_negative: AtomicU64::new(0),
+            lookup_error: AtomicU64::new(0),
             stats: AtomicBool::new(false),
         }
     }
@@ -172,6 +185,19 @@ impl<F: FileSystem + Sync> Server<F> {
                 Some(name) => warn!("fs:   {name:<20} {count:>12} {share:>7.2}%"),
                 None => warn!("fs:   opcode {opcode:<13} {count:>12} {share:>7.2}%"),
             }
+        }
+
+        let positive = self.lookup_positive.load(Ordering::Relaxed);
+        let negative = self.lookup_negative.load(Ordering::Relaxed);
+        let error = self.lookup_error.load(Ordering::Relaxed);
+        let lookups = positive + negative + error;
+        if lookups != 0 {
+            let miss = (negative + error) as f64 * 100.0 / lookups as f64;
+            warn!(
+                "fs:   lookup {positive} positive, {negative} negative, {error} error \
+                 ({miss:.2}% of lookups found nothing; {:.2}% of requests)",
+                lookups as f64 * 100.0 / (total as f64).max(1.0)
+            );
         }
     }
 
@@ -311,11 +337,19 @@ impl<F: FileSystem + Sync> Server<F> {
             .lookup(Context::from(in_header), in_header.nodeid.into(), name)
         {
             Ok(entry) => {
+                self.lookup_positive.fetch_add(1, Ordering::Relaxed);
                 let out = EntryOut::from(entry);
 
                 reply_ok(Some(out), None, in_header.unique, w)
             }
-            Err(e) => reply_error(e, in_header.unique, w),
+            Err(e) => {
+                if e.raw_os_error() == Some(libc::ENOENT) {
+                    self.lookup_negative.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    self.lookup_error.fetch_add(1, Ordering::Relaxed);
+                }
+                reply_error(e, in_header.unique, w)
+            }
         }
     }
 

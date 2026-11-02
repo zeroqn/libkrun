@@ -1034,7 +1034,7 @@ checksum = "b0d28e293f2b8c9d2b2d1c0193bd3c1cbdc0d2cf396888dc01162f7cf9d6c3f3"
 [[package]]
 name = "magma-gpu"
 version = "0.1.85"
-source = "git+https://github.com/zeroqn/rutabaga_gfx?rev=d8479a1edb560228a55a4e6fd5817145c39e99d9#d8479a1edb560228a55a4e6fd5817145c39e99d9"
+source = "git+https://github.com/zeroqn/rutabaga_gfx?rev=2fd63c700afb31de5c4374e385f7dff7549b0664#2fd63c700afb31de5c4374e385f7dff7549b0664"
 dependencies = [
  "cfg-if",
  "libc",
@@ -1445,7 +1445,7 @@ checksum = "b39cdef0fa800fc44525c84ccb54a029961a8215f9619753635a9c0d2538d46d"
 [[package]]
 name = "rutabaga_gfx"
 version = "0.1.85"
-source = "git+https://github.com/zeroqn/rutabaga_gfx?rev=d8479a1edb560228a55a4e6fd5817145c39e99d9#d8479a1edb560228a55a4e6fd5817145c39e99d9"
+source = "git+https://github.com/zeroqn/rutabaga_gfx?rev=2fd63c700afb31de5c4374e385f7dff7549b0664#2fd63c700afb31de5c4374e385f7dff7549b0664"
 dependencies = [
  "cfg-if",
  "libc",

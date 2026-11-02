@@ -1,24 +1,26 @@
 # cang downstream libkrun branch
 
 Based on upstream `main` - the 2.0.0 / C-ABI-2 line - as of
-`a1d8616765da03980f3be1bb8714bfdd3842f33c` (2026-10-16). The previous base was
-`a980e7795b86c8151e867b32a43af4cb984364fa`, and before the ABI-2 switch,
+`a0375321bb1e6e51312e022af53e9e7668d3a07e` (2026-10-29). The previous base was
+`a1d8616765da03980f3be1bb8714bfdd3842f33c`, and before the ABI-2 switch,
 upstream release `v1.19.5` (the `stable-1.19.x` line).
 
 ## Carried from upstream, still unmerged
 
-Two open upstream PRs are cherry-picked on top of the base, each as its own
-commit with a `(cherry picked from upstream PR #N ...)` trailer so it can be
-dropped the day upstream merges it:
+One open upstream PR is cherry-picked on top of the base, as its own commit with
+a `(cherry picked from upstream PR #N ...)` trailer so it can be dropped the day
+upstream merges it:
 
-- PR 865 - virtio/blk parallel reads with an auto-sized, overridable read-pool
-  (`krun_block_device_set_read_pool_size`). The PR leaves the feature opt-in;
-  the fork turns it on by default (`parallel_reads = true` in
-  `BlockDevice::new`), so a caller that never touches the setter still gets the
-  thread pool. Because that default is a one-line fork commit, a caller that
-  must not depend on it - cang's `crates/cang-libkrun` does - can still set it
-  explicitly and survive the commit being dropped.
 - PR 840 - guest-clock workarounds
+
+PR 865 (virtio/blk parallel reads with an auto-sized, overridable read pool,
+`krun_block_device_set_read_pool_size`) is merged upstream and part of the base,
+so its three cherry-picks are gone. The fork keeps only the default flip:
+`parallel_reads = true` in `BlockDevice::new`, so a caller that never touches
+`set_parallel_reads` still gets the thread pool. Because that default is a
+one-line fork commit, a caller that must not depend on it - cang's
+`crates/cang-libkrun` does - can still set it explicitly and survive the commit
+being dropped.
 
 Upstream PR 822 (virtio-gpu `CREATE_GUEST_HANDLE`, the zero-copy SHM fast path)
 is deliberately **not** carried: the path is inert on the pinned kernel, the PR's

@@ -789,6 +789,32 @@ impl<'a> FsDevice<'a> {
         self.inner.lock().unwrap().set_cache_symlinks(enabled);
     }
 
+    /// How long the client may consider a directory entry valid, in
+    /// milliseconds.
+    ///
+    /// The lifetime of every *positive* lookup answer and, with
+    /// `set_cache_symlinks`, of every cached symlink target: a name the host
+    /// renames or removes, or a target it retargets, stays as the client last saw
+    /// it for up to this long. It is what decides how many `LOOKUP`s a workload
+    /// issues. Raise it only on a share whose names do not change underneath the
+    /// client; the 5 s default is the coherence promise of a live host tree.
+    pub fn set_entry_timeout(&mut self, timeout_millis: u64) {
+        self.inner
+            .lock()
+            .unwrap()
+            .set_entry_timeout(std::time::Duration::from_millis(timeout_millis.max(1)));
+    }
+
+    /// How long the client may consider a file's or directory's attributes valid,
+    /// in milliseconds. Same trade as `set_entry_timeout`: it is the window in
+    /// which an mtime or size the host changed is still reported as the old one.
+    pub fn set_attr_timeout(&mut self, timeout_millis: u64) {
+        self.inner
+            .lock()
+            .unwrap()
+            .set_attr_timeout(std::time::Duration::from_millis(timeout_millis.max(1)));
+    }
+
     /// Report the opcode mix the device served when it stops.
     ///
     /// The guest kernel cannot trace fuse requests, so a histogram counted here

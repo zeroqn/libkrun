@@ -880,6 +880,52 @@
           "ffi_name": "krun_fs_device_set_cache_symlinks"
         },
         {
+          "name": "set_entry_timeout",
+          "doc": [
+            " How long the client may consider a directory entry valid, in",
+            " milliseconds.",
+            "",
+            " The lifetime of every *positive* lookup answer and, with",
+            " `set_cache_symlinks`, of every cached symlink target: a name the host",
+            " renames or removes, or a target it retargets, stays as the client last saw",
+            " it for up to this long. It is what decides how many `LOOKUP`s a workload",
+            " issues. Raise it only on a share whose names do not change underneath the",
+            " client; the 5 s default is the coherence promise of a live host tree."
+          ],
+          "receiver": "mut",
+          "params": [
+            {
+              "name": "timeout_millis",
+              "param_kind": "regular",
+              "type": "u64"
+            }
+          ],
+          "ret": {
+            "return_kind": "void"
+          },
+          "ffi_name": "krun_fs_device_set_entry_timeout"
+        },
+        {
+          "name": "set_attr_timeout",
+          "doc": [
+            " How long the client may consider a file's or directory's attributes valid,",
+            " in milliseconds. Same trade as `set_entry_timeout`: it is the window in",
+            " which an mtime or size the host changed is still reported as the old one."
+          ],
+          "receiver": "mut",
+          "params": [
+            {
+              "name": "timeout_millis",
+              "param_kind": "regular",
+              "type": "u64"
+            }
+          ],
+          "ret": {
+            "return_kind": "void"
+          },
+          "ffi_name": "krun_fs_device_set_attr_timeout"
+        },
+        {
           "name": "set_opcode_stats",
           "doc": [
             " Report the opcode mix the device served when it stops.",

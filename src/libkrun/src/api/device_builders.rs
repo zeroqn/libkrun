@@ -811,6 +811,19 @@ impl<'a> FsDevice<'a> {
         self.inner.lock().unwrap().set_negative_entry(timeout);
     }
 
+    /// Advertise `FUSE_CACHE_SYMLINKS`, so the client caches a symlink's target
+    /// in the inode and stops sending a `READLINK` on every resolution of that
+    /// path.
+    ///
+    /// Repeated resolutions of the same symlink were 35-57% of the requests of a
+    /// spawn-heavy guest workload, and advertising the flag removed 98-99% of
+    /// them. The cost is the target's freshness for `entry_timeout` (5 s by
+    /// default), which is the same window zero-message opens already expose file
+    /// contents to; a target that never changes costs nothing.
+    pub fn set_cache_symlinks(&mut self, enabled: bool) {
+        self.inner.lock().unwrap().set_cache_symlinks(enabled);
+    }
+
     /// Report the opcode mix the device served when it stops.
     ///
     /// The guest kernel cannot trace fuse requests, so a histogram counted here

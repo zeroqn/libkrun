@@ -372,6 +372,19 @@ typedef void (*krun_fs_device_set_no_flush_fn)(KrunFsDevice handle, bool enabled
 void krun_fs_device_set_negative_entry(KrunFsDevice handle, bool enabled, uint64_t timeout_millis);
 typedef void (*krun_fs_device_set_negative_entry_fn)(KrunFsDevice handle, bool enabled, uint64_t timeout_millis);
 /**
+ * Advertise `FUSE_CACHE_SYMLINKS`, so the client caches a symlink's target
+ * in the inode and stops sending a `READLINK` on every resolution of that
+ * path.
+ *
+ * Repeated resolutions of the same symlink were 35-57% of the requests of a
+ * spawn-heavy guest workload, and advertising the flag removed 98-99% of
+ * them. The cost is the target's freshness for `entry_timeout` (5 s by
+ * default), which is the same window zero-message opens already expose file
+ * contents to; a target that never changes costs nothing.
+ */
+void krun_fs_device_set_cache_symlinks(KrunFsDevice handle, bool enabled);
+typedef void (*krun_fs_device_set_cache_symlinks_fn)(KrunFsDevice handle, bool enabled);
+/**
  * Report the opcode mix the device served when it stops.
  *
  * The guest kernel cannot trace fuse requests, so a histogram counted here

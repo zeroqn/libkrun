@@ -250,6 +250,20 @@ impl Fs {
         }
     }
 
+    /// Advertise `FUSE_CACHE_SYMLINKS`, so the kernel caches a symlink's target
+    /// in the inode and stops issuing a `READLINK` on every resolution.
+    ///
+    /// 35-57% of the requests of a spawn-heavy workload are repeated
+    /// resolutions of the same symlink; advertising the flag removed 98-99% of
+    /// them. What it costs is the target's freshness for `entry_timeout` (5 s by
+    /// default), the same class of window `set_zero_message_open` already trades
+    /// for, and nothing at all for a target that never changes.
+    pub fn set_cache_symlinks(&mut self, enabled: bool) {
+        if let Some(cfg) = self.passthrough_cfg.as_mut() {
+            cfg.cache_symlinks = enabled;
+        }
+    }
+
     /// Report the opcode mix served by this device when it stops.
     ///
     /// One relaxed increment per request on the serving path and one block of

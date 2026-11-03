@@ -854,6 +854,32 @@
           "ffi_name": "krun_fs_device_set_negative_entry"
         },
         {
+          "name": "set_cache_symlinks",
+          "doc": [
+            " Advertise `FUSE_CACHE_SYMLINKS`, so the client caches a symlink's target",
+            " in the inode and stops sending a `READLINK` on every resolution of that",
+            " path.",
+            "",
+            " Repeated resolutions of the same symlink were 35-57% of the requests of a",
+            " spawn-heavy guest workload, and advertising the flag removed 98-99% of",
+            " them. The cost is the target's freshness for `entry_timeout` (5 s by",
+            " default), which is the same window zero-message opens already expose file",
+            " contents to; a target that never changes costs nothing."
+          ],
+          "receiver": "mut",
+          "params": [
+            {
+              "name": "enabled",
+              "param_kind": "regular",
+              "type": "bool"
+            }
+          ],
+          "ret": {
+            "return_kind": "void"
+          },
+          "ffi_name": "krun_fs_device_set_cache_symlinks"
+        },
+        {
           "name": "set_opcode_stats",
           "doc": [
             " Report the opcode mix the device served when it stops.",

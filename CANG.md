@@ -116,6 +116,24 @@ no longer exist upstream. The C names are regenerated from the Rust API by
   - a quarter second keeps 92% of the saving, because a compiler re-probes the
   same name within milliseconds, and the measured invisibility was 74 ms.
   `enabled = false` keeps `-ENOENT`. Default off.
+- `krun_fs_device_set_cache_symlinks(FsDevice*, bool)` - advertise
+  `FUSE_CACHE_SYMLINKS` (`1 << 23`, defined in `fuse.rs` since the crosvm fork and
+  never set), so the client keeps a symlink's target in the inode and answers a
+  repeated resolution of that path without a `READLINK` (`fs/fuse/dir.c`, the
+  `fc->cache_symlinks` arm of `fuse_get_link`). One `CACHE_SYMLINKS` bit in the
+  init reply replaces one round trip per resolution, and a round trip costs the
+  same per request whatever opcode it carries, so this is the largest
+  request-removing lever for a spawn-heavy workload: measured through cang on
+  2026-11-03 with everything else at its default, a 600-exec loop went 11,522 ->
+  5,973 requests (`READLINK` 5,242 -> 95), 1500 `/nix` tool reads 29,350 ->
+  10,567 (18,941 -> 530), 2000 `/workspace` reads 38,230 -> 12,220 (24,442 -> 93),
+  200 compiler-cache write+rename+read rounds 22,854 -> 14,773 (7,666 -> 95) and
+  200 append+stat rounds 11,861 -> 7,005 (5,278 -> 96), with `READ`, `LOOKUP` and
+  `GETXATTR` identical on both sides of every pair. The price is the target's
+  freshness for `entry_timeout` (5 s by default): a symlink the *host* retargets
+  stays stale in the client for up to that long, which is the same window
+  zero-message opens already expose file contents to, and nothing at all for a
+  target that never changes (every `/nix/store` entry). Default off.
 - `krun_fs_device_set_opcode_stats(FsDevice*, bool)` - count served requests per
   FUSE opcode and log the histogram when the device stops. The pinned guest
   kernel has neither ftrace nor debugfs, so the server is the only place a

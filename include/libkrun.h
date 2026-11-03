@@ -385,6 +385,26 @@ typedef void (*krun_fs_device_set_negative_entry_fn)(KrunFsDevice handle, bool e
 void krun_fs_device_set_cache_symlinks(KrunFsDevice handle, bool enabled);
 typedef void (*krun_fs_device_set_cache_symlinks_fn)(KrunFsDevice handle, bool enabled);
 /**
+ * How long the client may consider a directory entry valid, in
+ * milliseconds.
+ *
+ * The lifetime of every *positive* lookup answer and, with
+ * `set_cache_symlinks`, of every cached symlink target: a name the host
+ * renames or removes, or a target it retargets, stays as the client last saw
+ * it for up to this long. It is what decides how many `LOOKUP`s a workload
+ * issues. Raise it only on a share whose names do not change underneath the
+ * client; the 5 s default is the coherence promise of a live host tree.
+ */
+void krun_fs_device_set_entry_timeout(KrunFsDevice handle, uint64_t timeout_millis);
+typedef void (*krun_fs_device_set_entry_timeout_fn)(KrunFsDevice handle, uint64_t timeout_millis);
+/**
+ * How long the client may consider a file's or directory's attributes valid,
+ * in milliseconds. Same trade as `set_entry_timeout`: it is the window in
+ * which an mtime or size the host changed is still reported as the old one.
+ */
+void krun_fs_device_set_attr_timeout(KrunFsDevice handle, uint64_t timeout_millis);
+typedef void (*krun_fs_device_set_attr_timeout_fn)(KrunFsDevice handle, uint64_t timeout_millis);
+/**
  * Report the opcode mix the device served when it stops.
  *
  * The guest kernel cannot trace fuse requests, so a histogram counted here

@@ -301,6 +301,36 @@ impl Fs {
         }
     }
 
+    /// How long the client may consider a directory entry valid, in seconds.
+    ///
+    /// This is the lifetime of every *positive* lookup answer and of every
+    /// symlink target when `set_cache_symlinks` is on: a name the host renames or
+    /// removes, or a target it retargets, stays as the client last saw it for up
+    /// to this long. It is the knob that decides how many `LOOKUP`s a workload
+    /// issues - `LOOKUP` is ~45% of the remaining requests of a spawn-heavy
+    /// workload even at the 5 s default.
+    ///
+    /// Safe to raise only on a share whose names do not change underneath the
+    /// client (a read-only content-addressed store, say); on the share that
+    /// carries a live host tree the 5 s default *is* the coherence promise.
+    pub fn set_entry_timeout(&mut self, timeout: Duration) {
+        if let Some(cfg) = self.passthrough_cfg.as_mut() {
+            cfg.entry_timeout = timeout;
+        }
+    }
+
+    /// How long the client may consider a file's or directory's attributes valid.
+    ///
+    /// Bound to `entry_timeout`'s reasoning: it is the window in which a size,
+    /// mode or mtime the host changed is still reported as the old one, and it is
+    /// the timeout zero-message opens rely on for the "in-place host rewrite"
+    /// cost.
+    pub fn set_attr_timeout(&mut self, timeout: Duration) {
+        if let Some(cfg) = self.passthrough_cfg.as_mut() {
+            cfg.attr_timeout = timeout;
+        }
+    }
+
     /// Report the opcode mix served by this device when it stops.
     ///
     /// One relaxed increment per request on the serving path and one block of
@@ -448,6 +478,28 @@ mod tests {
             Vec::new(),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn cache_symlinks_and_timeouts_are_settable_per_device() {
+        let mut fs = filesystem(Some("/".to_owned()));
+        let cfg = fs.passthrough_cfg.as_ref().unwrap();
+        assert!(!cfg.cache_symlinks, "symlink caching stays off unless asked");
+        assert_eq!(cfg.entry_timeout, Duration::from_secs(5));
+        assert_eq!(cfg.attr_timeout, Duration::from_secs(5));
+
+        fs.set_cache_symlinks(true);
+        fs.set_entry_timeout(Duration::from_secs(60));
+        fs.set_attr_timeout(Duration::from_secs(60));
+        let cfg = fs.passthrough_cfg.as_ref().unwrap();
+        assert!(cfg.cache_symlinks);
+        assert_eq!(cfg.entry_timeout, Duration::from_secs(60));
+        assert_eq!(cfg.attr_timeout, Duration::from_secs(60));
+
+        // None of the other switches move with them.
+        assert!(matches!(cfg.cache_policy, CachePolicy::Auto));
+        assert!(matches!(cfg.semantics, PermissionSemantics::LinuxComplete));
+        assert!(cfg.xattr);
     }
 
     #[test]

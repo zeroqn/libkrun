@@ -447,7 +447,10 @@ mod tests {
     fn cache_symlinks_and_timeouts_are_settable_per_device() {
         let mut fs = filesystem(Some("/".to_owned()));
         let cfg = fs.passthrough_cfg.as_ref().unwrap();
-        assert!(!cfg.cache_symlinks, "symlink caching stays off unless asked");
+        assert!(
+            !cfg.cache_symlinks,
+            "symlink caching stays off unless asked"
+        );
         assert_eq!(cfg.entry_timeout, Duration::from_secs(5));
         assert_eq!(cfg.attr_timeout, Duration::from_secs(5));
 

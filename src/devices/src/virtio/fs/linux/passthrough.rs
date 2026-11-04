@@ -36,6 +36,18 @@ const PROC_CSTR: &[u8] = b"/proc/self/fd\0";
 type Inode = u64;
 type Handle = u64;
 
+/// The key an inode record is found by, other than its nodeid: a *verified*
+/// cache of `(st_ino, st_dev, mnt_id) -> nodeid`.
+///
+/// cang: the triple is not a unique identity for every tree a share can export.
+/// An overlay whose layers are separate btrfs subvolumes has two independent
+/// inode spaces and one synthesized `st_dev` (measured: two fresh subvolumes
+/// both number from 257, so distinct objects report the same pair). It stays the
+/// key, because it is what folds one object reached through several names, but a
+/// hit is *checked* against the object the caller is looking at
+/// (`same_stat_identity`) and a mismatch must not disturb the incumbent: the
+/// colliding object gets an inode of its own that is deliberately absent from
+/// this map, so nothing is evicted and both stay addressable.
 #[derive(Clone, Copy, PartialOrd, Ord, PartialEq, Eq)]
 struct InodeAltKey {
     ino: libc::ino64_t,
@@ -323,6 +335,27 @@ fn submount_attr_flags(
     } else {
         0
     }
+}
+
+/// Whether a cached descriptor's object is the object `st` describes.
+///
+/// cang: `(ino, dev)` alone is not that answer. A share whose export spans two
+/// btrfs subvolumes has two independent inode spaces and one synthesized
+/// `st_dev`, so distinct objects routinely report the same pair - measured on two
+/// fresh subvolumes, both numbering from 257. Comparing the rest of the stat
+/// identity as well (kind, size, timestamps, link count) rejects those
+/// collisions while still accepting the same object seen twice, which is the only
+/// case the inode cache needs to fold.
+fn same_stat_identity(cached: &libc::stat64, live: &libc::stat64) -> bool {
+    cached.st_ino == live.st_ino
+        && cached.st_dev == live.st_dev
+        && (cached.st_mode & libc::S_IFMT) == (live.st_mode & libc::S_IFMT)
+        && cached.st_size == live.st_size
+        && cached.st_mtime == live.st_mtime
+        && cached.st_mtime_nsec == live.st_mtime_nsec
+        && cached.st_ctime == live.st_ctime
+        && cached.st_ctime_nsec == live.st_ctime_nsec
+        && cached.st_nlink == live.st_nlink
 }
 
 /// The cacheable form of "this name does not exist".
@@ -1169,6 +1202,11 @@ impl FileSystem for PassthroughFs {
                 mnt_id,
             };
             let known = self.inodes.read().unwrap().get_alt(&altkey).cloned();
+            let known = known.filter(|data| {
+                let mut cached: libc::stat64 = unsafe { std::mem::zeroed() };
+                let rc = unsafe { libc::fstat64(data.file.as_raw_fd(), &mut cached) };
+                rc == 0 && same_stat_identity(&cached, &st)
+            });
             if let Some(data) = known {
                 // Matches with the release store in `forget`.
                 data.refcount.fetch_add(1, Ordering::Acquire);
@@ -1226,6 +1264,11 @@ impl FileSystem for PassthroughFs {
             mnt_id,
         };
         let data = self.inodes.read().unwrap().get_alt(&altkey).cloned();
+        let data = data.filter(|data| {
+            let mut cached: libc::stat64 = unsafe { std::mem::zeroed() };
+            let rc = unsafe { libc::fstat64(data.file.as_raw_fd(), &mut cached) };
+            rc == 0 && same_stat_identity(&cached, &st)
+        });
 
         let inode = if let Some(data) = data {
             // Matches with the release store in `forget`.
@@ -1236,22 +1279,32 @@ impl FileSystem for PassthroughFs {
             // into the inode list.  However, since each of those will get a unique Inode
             // value and unique file descriptors this shouldn't be that much of a problem.
             let inode = self.inode_alloc.next();
-            self.inodes.write().unwrap().insert(
+            let data = Arc::new(InodeData {
                 inode,
-                InodeAltKey {
-                    ino: st.st_ino,
-                    dev: st.st_dev,
-                    mnt_id,
-                },
-                Arc::new(InodeData {
-                    inode,
-                    file: f,
-                    dev: st.st_dev,
-                    mnt_id,
-                    refcount: AtomicU64::new(1),
-                    zero_open: ZeroOpenFiles::default(),
-                }),
-            );
+                file: f,
+                dev: st.st_dev,
+                mnt_id,
+                refcount: AtomicU64::new(1),
+                zero_open: ZeroOpenFiles::default(),
+            });
+            // A key already held by a different object (two layers whose inode
+            // numbers collide) must not replace that object's entry: `insert`
+            // would drop the incumbent from the main map and its nodeid would
+            // stop resolving. Register this inode by nodeid only.
+            let key_taken = self
+                .inodes
+                .read()
+                .unwrap()
+                .get_alt(&altkey)
+                .is_some_and(|other| other.inode != inode);
+            if key_taken {
+                self.inodes
+                    .write()
+                    .unwrap()
+                    .insert_main_only(inode, altkey, data);
+            } else {
+                self.inodes.write().unwrap().insert(inode, altkey, data);
+            }
 
             inode
         };

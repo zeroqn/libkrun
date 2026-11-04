@@ -74,6 +74,18 @@ where
     /// removed, and the old value is returned. If **both** keys were present then the value
     /// associated with the main key is updated, the value associated with the alternate key is
     /// removed, and the old value associated with the main key is returned.
+    /// Register a value under its primary key only, leaving the alternative
+    /// index untouched.
+    ///
+    /// cang: used when the alternative key is already held by a *different*
+    /// object. `insert` would evict that incumbent (`alt` is single-valued), and
+    /// an evicted nodeid stops resolving, so a collision - which an overlay over
+    /// two btrfs subvolumes produces by the hundred, since both layers number
+    /// their inodes from 257 - must not go through the alt index at all.
+    pub fn insert_main_only(&mut self, k1: K1, k2: K2, v: V) -> Option<V> {
+        self.main.insert(k1, (k2, v)).map(|(_, v)| v)
+    }
+
     pub fn insert(&mut self, k1: K1, k2: K2, v: V) -> Option<V> {
         let oldval = match self.alt.insert(k2.clone(), k1.clone()) {
             Some(oldkey) => self.main.remove(&oldkey),

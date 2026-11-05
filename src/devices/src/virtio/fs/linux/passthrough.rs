@@ -201,6 +201,51 @@ pub fn drop_effective_cap(cap: Capability) -> io::Result<Option<ScopedCaps>> {
     ScopedCaps::new(cap)
 }
 
+/// Do the privilege dropping a `HANDLE_KILLPRIV_V2` client delegates to us.
+///
+/// The client's kernel no longer asks whether a write needs `security.capability`
+/// removed (it sets `SB_NOSEC` when we ack the option), so the server owes the
+/// work: `security.capability` goes unconditionally, and the set-user-ID and
+/// set-group-ID bits go when the request said so. Both are local syscalls on the
+/// backing file; a missing xattr or an inode without the bits is the normal case
+/// and costs one `fremovexattr` plus one `fstat`.
+fn drop_file_privileges(fd: RawFd, kill_suid_sgid: bool) -> io::Result<()> {
+    // `security.capability` is the only xattr the client used to ask about, and
+    // the only one a write or a truncate is required to clear.
+    const CAPS: &[u8] = b"security.capability\0";
+    // Safe: this only reads the constant name and touches one fd. `-ENODATA` /
+    // `-EOPNOTSUPP` mean there is nothing to clear, which is the common case.
+    unsafe { libc::fremovexattr(fd, CAPS.as_ptr() as *const core::ffi::c_char) };
+
+    if !kill_suid_sgid {
+        return Ok(());
+    }
+    let mut st = MaybeUninit::<libc::stat64>::zeroed();
+    // Safe: the kernel only writes into `st`, and the return value is checked.
+    let res = unsafe {
+        libc::fstatat64(
+            fd,
+            EMPTY_CSTR.as_ptr() as *const libc::c_char,
+            st.as_mut_ptr(),
+            libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if res < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // Safe: a successful `fstatat64` filled the struct.
+    let st = unsafe { st.assume_init() };
+    let setid = (libc::S_ISUID | libc::S_ISGID) as libc::mode_t;
+    if st.st_mode & setid == 0 {
+        return Ok(());
+    }
+    // Safe: same fd, a mode derived from the file's own mode.
+    if unsafe { libc::fchmod(fd, st.st_mode & !setid) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 fn ebadf() -> io::Error {
     io::Error::from_raw_os_error(libc::EBADF)
 }
@@ -914,7 +959,14 @@ impl PassthroughFs {
             } else {
                 None
             };
-            RwLock::new(self.open_inode(inode, flags as i32)?)
+            let file = self.open_inode(inode, flags as i32)?;
+            // `O_TRUNC` from a `HANDLE_KILLPRIV_V2` client arrives as
+            // `FUSE_OPEN_KILL_SUIDGID`: a truncate does not clear capabilities, so
+            // the server clears them, as `create` and `setattr` also do.
+            if kill_priv && flags & (libc::O_TRUNC as u32) != 0 {
+                drop_file_privileges(file.as_raw_fd(), true)?;
+            }
+            RwLock::new(file)
         };
 
         let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
@@ -1132,6 +1184,13 @@ impl FileSystem for PassthroughFs {
         );
 
         let mut opts = FsOptions::DO_READDIRPLUS | FsOptions::READDIRPLUS_AUTO;
+        // `HANDLE_KILLPRIV_V2` makes the *server* responsible for dropping file
+        // privileges: the client's kernel stops asking for `security.capability`
+        // before a write and asks for the drop on the request instead
+        // (`FUSE_WRITE_KILL_SUIDGID`, `FUSE_OPEN_KILL_SUIDGID`,
+        // `FATTR_KILL_SUIDGID`). `server.rs` already advertises the option to every
+        // client, so `write`/`open`/`create`/`setattr` below owe that work - see
+        // `drop_file_privileges`.
         if self.cfg.writeback && capable.contains(FsOptions::WRITEBACK_CACHE) {
             opts |= FsOptions::WRITEBACK_CACHE;
             self.writeback.store(true, Ordering::Relaxed);
@@ -1518,6 +1577,13 @@ impl FileSystem for PassthroughFs {
         // Safe because we just opened this fd.
         let file = RwLock::new(unsafe { File::from_raw_fd(fd) });
 
+        // `O_TRUNC` over an existing file arrives as `FUSE_OPEN_KILL_SUIDGID` from
+        // a `HANDLE_KILLPRIV_V2` client; a truncate does not clear capabilities, so
+        // the server does here, the same as `open` and `setattr` do.
+        if kill_priv && flags & (libc::O_TRUNC as u32) != 0 {
+            drop_file_privileges(file.read().unwrap().as_raw_fd(), true)?;
+        }
+
         let entry = self.lookup(ctx, parent, name)?;
 
         // With zero-message opens the kernel never sends `FUSE_RELEASE` again -
@@ -1704,16 +1770,40 @@ impl FileSystem for PassthroughFs {
             if res < 0 {
                 return Err(io::Error::last_os_error());
             }
+            // A chown clears `security.capability` and the client no longer asks,
+            // so the server clears it. The inode's own descriptor is `O_PATH`,
+            // which cannot remove an xattr, and a chown is often to an owner that
+            // cannot read the file - so this opens one fresh and stays
+            // best-effort: a failure here must not fail the chown, and the next
+            // write or truncate clears the xattr anyway. The set-id bits are not
+            // this call's business; the host kernel drops those on a chown.
+            if let Ok(f) = self.open_inode(inode, libc::O_NONBLOCK) {
+                let _ = drop_file_privileges(f.as_raw_fd(), false);
+            }
         }
 
         if valid.contains(SetattrValid::SIZE) {
+            // A `HANDLE_KILLPRIV_V2` client stops asking whether a truncate must
+            // clear `security.capability` and says so on the request instead, so
+            // the drop happens here, on the same fd the truncate went through.
+            let kill_sgid = valid.contains(SetattrValid::KILL_SUIDGID);
             // Safe because this doesn't modify any memory and we check the return value.
             let res = match data {
-                Data::Handle(fd) => unsafe { libc::ftruncate(fd, attr.st_size) },
-                _ => {
+                Data::Handle(fd) => unsafe {
+                    let res = libc::ftruncate(fd, attr.st_size);
+                    if res == 0 {
+                        drop_file_privileges(fd, kill_sgid)?;
+                    }
+                    res
+                },
+                Data::ProcPath(_) => {
                     // There is no `ftruncateat` so we need to get a new fd and truncate it.
                     let f = self.open_inode(inode, libc::O_NONBLOCK | libc::O_RDWR)?;
-                    unsafe { libc::ftruncate(f.as_raw_fd(), attr.st_size) }
+                    let res = unsafe { libc::ftruncate(f.as_raw_fd(), attr.st_size) };
+                    if res == 0 {
+                        drop_file_privileges(f.as_raw_fd(), kill_sgid)?;
+                    }
+                    res
                 }
             };
             if res < 0 {
@@ -2480,6 +2570,33 @@ impl FileSystem for PassthroughFs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A client that negotiated `HANDLE_KILLPRIV_V2` stops clearing privileges
+    /// itself, so the server's `drop_file_privileges` is what keeps a written or
+    /// truncated file from keeping its set-id bits. `security.capability` is not
+    /// asserted on: a non-root test cannot set it, and the call is unconditional.
+    #[test]
+    fn drop_file_privileges_clears_the_set_id_bits_only_when_asked() {
+        let path = std::env::temp_dir().join(format!(
+            "cang-killpriv-test-{}",
+            std::process::id()
+        ));
+        let file = std::fs::File::create(&path).expect("create probe file");
+        let fd = file.as_raw_fd();
+        // Safe: a plain fchmod on our own descriptor.
+        assert_eq!(unsafe { libc::fchmod(fd, 0o4755) }, 0, "fchmod 4755");
+
+        drop_file_privileges(fd, false).expect("drop without the set-id request");
+        let kept = stat(&file).expect("stat").st_mode & 0o7777;
+        assert_eq!(kept, 0o4755, "a request without KILL_SUIDGID keeps the bits");
+
+        drop_file_privileges(fd, true).expect("drop with the set-id request");
+        let cleared = stat(&file).expect("stat").st_mode & 0o7777;
+        assert_eq!(cleared, 0o755, "KILL_SUIDGID clears set-user-ID");
+
+        drop(file);
+        let _ = std::fs::remove_file(&path);
+    }
 
     /// A share configured for symlink caching advertises `FUSE_CACHE_SYMLINKS`
     /// so the client answers repeated resolutions of the same symlink from the

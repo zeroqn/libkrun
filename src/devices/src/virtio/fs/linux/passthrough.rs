@@ -254,6 +254,57 @@ fn einval() -> io::Error {
     io::Error::from_raw_os_error(libc::EINVAL)
 }
 
+/// The device number of an overlayfs whiteout: a char device 0/0, i.e.
+/// `makedev(0, 0)`.
+const WHITEOUT_RDEV: libc::dev_t = 0;
+
+/// Whether a rename request asks for a whiteout to be left at the old name.
+fn wants_whiteout(flags: u32) -> bool {
+    flags & libc::RENAME_WHITEOUT != 0
+}
+
+/// Whether a `RENAME_WHITEOUT` failure means "this backing filesystem cannot
+/// produce a whiteout" rather than a real error (a missing source, an unwritable
+/// directory, a flag combination the kernel rejects, ...).
+///
+/// `EINVAL` and `EOPNOTSUPP` are what filesystems without whiteout support
+/// return, and `ENOSYS` is what a kernel that does not know `RENAME_WHITEOUT`
+/// returns for `renameat2`.
+fn whiteout_unsupported(err: &io::Error) -> bool {
+    matches!(
+        err.raw_os_error(),
+        Some(libc::EINVAL) | Some(libc::EOPNOTSUPP) | Some(libc::ENOSYS)
+    )
+}
+
+/// Leave the whiteout a `RENAME_WHITEOUT` is meant to produce: a char device
+/// with device number 0/0 at `name` in `dir`.
+///
+/// This is what overlayfs reads back with `ovl_upper_is_whiteout()` - both from
+/// its mount-time probe and when it replaces a lower file with a whiteout during
+/// copy-up. A pre-existing entry at the name (a retried request, or a filesystem
+/// that got as far as creating it) counts as success.
+fn create_whiteout(dir: &File, name: &CStr) -> io::Result<()> {
+    // Safe because this doesn't modify any memory and we check the return value.
+    let res = unsafe {
+        libc::mknodat(
+            dir.as_raw_fd(),
+            name.as_ptr(),
+            (libc::S_IFCHR | 0o600) as libc::mode_t,
+            WHITEOUT_RDEV,
+        )
+    };
+    if res == 0 {
+        return Ok(());
+    }
+
+    let err = io::Error::last_os_error();
+    if err.raw_os_error() == Some(libc::EEXIST) {
+        return Ok(());
+    }
+    Err(err)
+}
+
 fn stat(f: &File) -> io::Result<libc::stat64> {
     let mut st = MaybeUninit::<libc::stat64>::zeroed();
 
@@ -1879,7 +1930,7 @@ impl FileSystem for PassthroughFs {
         // Safe because this doesn't modify any memory and we check the return value.
         // TODO: Switch to libc::renameat2 once https://github.com/rust-lang/libc/pull/1508 lands
         // and we have glibc 2.28.
-        let res = unsafe {
+        let renameat2 = |flags: u32| unsafe {
             libc::syscall(
                 libc::SYS_renameat2,
                 old_inode.file.as_raw_fd(),
@@ -1889,11 +1940,26 @@ impl FileSystem for PassthroughFs {
                 flags,
             )
         };
-        if res == 0 {
-            Ok(())
-        } else {
-            Err(io::Error::last_os_error())
+
+        if renameat2(flags) == 0 {
+            return Ok(());
         }
+
+        let err = io::Error::last_os_error();
+        if !wants_whiteout(flags) || !whiteout_unsupported(&err) {
+            return Err(err);
+        }
+
+        // The backing filesystem cannot whiteout on its own - it does not
+        // implement RENAME_WHITEOUT, or does not know the flag at all. Perform
+        // the rename without it and then leave the whiteout behind ourselves: an
+        // overlayfs upper needs the char device at the old name, and silently
+        // performing a plain rename is what made it reject such a share.
+        if renameat2(flags & !libc::RENAME_WHITEOUT) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        create_whiteout(&old_inode.file, oldname)
     }
 
     fn mknod(
@@ -2577,10 +2643,7 @@ mod tests {
     /// asserted on: a non-root test cannot set it, and the call is unconditional.
     #[test]
     fn drop_file_privileges_clears_the_set_id_bits_only_when_asked() {
-        let path = std::env::temp_dir().join(format!(
-            "cang-killpriv-test-{}",
-            std::process::id()
-        ));
+        let path = std::env::temp_dir().join(format!("cang-killpriv-test-{}", std::process::id()));
         let file = std::fs::File::create(&path).expect("create probe file");
         let fd = file.as_raw_fd();
         // Safe: a plain fchmod on our own descriptor.
@@ -2588,7 +2651,10 @@ mod tests {
 
         drop_file_privileges(fd, false).expect("drop without the set-id request");
         let kept = stat(&file).expect("stat").st_mode & 0o7777;
-        assert_eq!(kept, 0o4755, "a request without KILL_SUIDGID keeps the bits");
+        assert_eq!(
+            kept, 0o4755,
+            "a request without KILL_SUIDGID keeps the bits"
+        );
 
         drop_file_privileges(fd, true).expect("drop with the set-id request");
         let cleared = stat(&file).expect("stat").st_mode & 0o7777;
@@ -2733,5 +2799,130 @@ mod tests {
              the server uid (the scoped_cred Drop regressed to restoring euid 0)"
         );
         Ok(())
+    }
+
+    /// Create a private directory to drive the whiteout code against. The tests
+    /// that need `mknod` skip themselves when the host refuses it (a container
+    /// without `CAP_MKNOD`, say): no whiteout can exist then.
+    fn whiteout_test_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("cang-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).expect("create test dir");
+        dir
+    }
+
+    /// A `RENAME_WHITEOUT` the backing filesystem cannot honour must not be
+    /// silently degraded to a plain rename: the server learns it has to leave
+    /// the whiteout itself, and the rename still happens.
+    #[test]
+    fn whiteout_decisions_are_limited_to_unsupported_errors() {
+        assert!(wants_whiteout(libc::RENAME_WHITEOUT));
+        assert!(wants_whiteout(
+            libc::RENAME_WHITEOUT | libc::RENAME_NOREPLACE
+        ));
+        assert!(!wants_whiteout(0));
+        assert!(!wants_whiteout(libc::RENAME_NOREPLACE));
+
+        for unsupported in [libc::EINVAL, libc::EOPNOTSUPP, libc::ENOSYS] {
+            assert!(
+                whiteout_unsupported(&io::Error::from_raw_os_error(unsupported)),
+                "{unsupported} means the filesystem cannot whiteout"
+            );
+        }
+        // Real errors must surface as they are, not trigger a second rename.
+        for real in [libc::ENOENT, libc::EPERM, libc::EXDEV, libc::EISDIR] {
+            assert!(
+                !whiteout_unsupported(&io::Error::from_raw_os_error(real)),
+                "{real} must not be treated as 'whiteout unsupported'"
+            );
+        }
+    }
+
+    /// The whiteout an overlayfs upper is built from is a char device 0/0 at the
+    /// vacated name; `EEXIST` (a retried request) is not an error.
+    #[test]
+    fn create_whiteout_leaves_a_char_device_zero_zero() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = whiteout_test_dir("whiteout-node");
+        let dirfd = File::open(&dir).expect("open the test directory");
+
+        if let Err(e) = create_whiteout(&dirfd, c"gone") {
+            if matches!(e.raw_os_error(), Some(libc::EPERM) | Some(libc::EACCES)) {
+                eprintln!("SKIP create_whiteout_leaves_a_char_device_zero_zero: {e}");
+                let _ = std::fs::remove_dir_all(&dir);
+                return;
+            }
+            panic!("create_whiteout: {e}");
+        }
+
+        let st = std::fs::symlink_metadata(dir.join("gone")).expect("stat the whiteout");
+        assert_eq!(st.mode() & libc::S_IFMT, libc::S_IFCHR);
+        assert_eq!(st.rdev(), 0, "a whiteout is device 0/0");
+
+        // A second attempt finds it already there and succeeds.
+        create_whiteout(&dirfd, c"gone").expect("EEXIST is success");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The end-to-end shape overlayfs' mount probe relies on: renaming a file
+    /// with `RENAME_WHITEOUT` through the trait must leave the file at the new
+    /// name and a char-device 0/0 at the old one. Before the fix the flag was
+    /// masked off in the server's `rename2()`, which turned this into a plain
+    /// rename and left nothing behind.
+    #[test]
+    fn rename_with_whiteout_leaves_the_node_at_the_old_name() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = whiteout_test_dir("whiteout-rename");
+        std::fs::write(dir.join("src"), b"payload").expect("write the source file");
+
+        let fs = PassthroughFs::new(
+            Config {
+                root_dir: dir.to_string_lossy().into_owned(),
+                ..Default::default()
+            },
+            Arc::new(InodeAllocator::new()),
+        )
+        .expect("passthrough fs over the test directory");
+        // `init()` is what registers the served directory as the root inode.
+        fs.init(FsOptions::empty()).expect("init");
+
+        let ctx = Context {
+            uid: 0,
+            gid: 0,
+            pid: 0,
+        };
+        let res = fs.rename(
+            ctx,
+            fuse::ROOT_ID,
+            c"src",
+            fuse::ROOT_ID,
+            c"dst",
+            libc::RENAME_WHITEOUT,
+        );
+        if let Err(e) = &res
+            && matches!(e.raw_os_error(), Some(libc::EPERM) | Some(libc::EACCES))
+        {
+            eprintln!("SKIP rename_with_whiteout_leaves_the_node_at_the_old_name: {e}");
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        res.expect("rename with RENAME_WHITEOUT");
+
+        assert_eq!(
+            std::fs::read(dir.join("dst")).expect("the renamed file"),
+            b"payload"
+        );
+        let whiteout = std::fs::symlink_metadata(dir.join("src")).expect("stat the whiteout");
+        assert_eq!(
+            whiteout.mode() & libc::S_IFMT,
+            libc::S_IFCHR,
+            "the vacated name must be a char device, not the old file"
+        );
+        assert_eq!(whiteout.rdev(), 0, "a whiteout is device 0/0");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -634,10 +634,14 @@ impl<F: FileSystem + Sync> Server<F> {
     fn rename2(&self, in_header: InHeader, mut r: Reader, w: Writer) -> Result<usize> {
         let Rename2In { newdir, flags, .. } = r.read_obj().map_err(Error::DecodeMessage)?;
 
-        #[cfg(target_os = "linux")]
-        let flags = flags & (libc::RENAME_EXCHANGE | libc::RENAME_NOREPLACE);
-
-        self.do_rename(in_header, size_of::<Rename2In>(), newdir, flags, r, w)
+        self.do_rename(
+            in_header,
+            size_of::<Rename2In>(),
+            newdir,
+            sanitize_rename2_flags(flags),
+            r,
+            w,
+        )
     }
 
     fn link(&self, in_header: InHeader, mut r: Reader, w: Writer) -> Result<usize> {
@@ -1618,6 +1622,29 @@ impl<F: FileSystem + Sync> Server<F> {
     }
 }
 
+/// Which `RENAME_*` flags a `RENAME2` request forwards to the filesystem
+/// implementation.
+///
+/// `RENAME_WHITEOUT` is forwarded rather than masked away: the client asks the
+/// server to leave a char-device 0/0 (the kernel whiteout) at the old name, and
+/// overlayfs depends on getting exactly that. Its mount-time probe
+/// (`ovl_check_rename_whiteout()`) renames a temp file in the workdir with
+/// `RENAME_WHITEOUT`, looks the old name up again and requires a real whiteout
+/// inode; masking the flag turned that request into a plain rename, so the probe
+/// failed and — because a FUSE upper revalidates — the share was refused with
+/// "upper fs missing required features". Any other bit is unknown to this
+/// protocol version and is dropped.
+fn sanitize_rename2_flags(flags: u32) -> u32 {
+    #[cfg(target_os = "linux")]
+    {
+        flags & (libc::RENAME_EXCHANGE | libc::RENAME_NOREPLACE | libc::RENAME_WHITEOUT)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        flags
+    }
+}
+
 fn reply_ok<T: ByteValued>(
     out: Option<T>,
     data: Option<&[u8]>,
@@ -1902,4 +1929,40 @@ pub fn opcode_name(opcode: u32) -> Option<&'static str> {
         _ => return None,
     };
     Some(name)
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::sanitize_rename2_flags;
+    use libc::{RENAME_EXCHANGE, RENAME_NOREPLACE, RENAME_WHITEOUT};
+
+    /// A `RENAME2` request must reach the filesystem with `RENAME_WHITEOUT`
+    /// intact: that flag is the whole point of overlayfs' mount probe and of
+    /// every copy-up that replaces a lower file with a whiteout.
+    #[test]
+    fn rename2_forwards_whiteout() {
+        assert_eq!(
+            sanitize_rename2_flags(RENAME_WHITEOUT),
+            RENAME_WHITEOUT,
+            "a whiteout rename must not be downgraded to a plain rename"
+        );
+        assert_eq!(
+            sanitize_rename2_flags(RENAME_WHITEOUT | RENAME_NOREPLACE),
+            RENAME_WHITEOUT | RENAME_NOREPLACE
+        );
+        let all = RENAME_EXCHANGE | RENAME_NOREPLACE | RENAME_WHITEOUT;
+        assert_eq!(sanitize_rename2_flags(all), all);
+    }
+
+    /// Flags the server does not implement must not reach the backend, which
+    /// would reinterpret them (or fail) in ways the client cannot expect.
+    #[test]
+    fn rename2_drops_unknown_flags() {
+        assert_eq!(sanitize_rename2_flags(0), 0);
+        assert_eq!(sanitize_rename2_flags(1 << 31), 0);
+        assert_eq!(
+            sanitize_rename2_flags((1 << 31) | RENAME_NOREPLACE),
+            RENAME_NOREPLACE
+        );
+    }
 }

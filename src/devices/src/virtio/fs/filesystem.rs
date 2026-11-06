@@ -593,11 +593,19 @@ pub trait FileSystem {
     /// until the lookup count goes to zero. See the documentation of the `forget` function for more
     /// information.
     ///
-    /// `flags` may be `libc::RENAME_EXCHANGE` or `libc::RENAME_NOREPLACE`. If
-    /// `libc::RENAME_NOREPLACE` is specified, the implementation must not overwrite `newname` if it
-    /// exists and must return an error instead. If `libc::RENAME_EXCHANGE` is specified, the
-    /// implementation must atomically exchange the two files, i.e., both must exist and neither may
-    /// be deleted.
+    /// `flags` may be `libc::RENAME_EXCHANGE`, `libc::RENAME_NOREPLACE` or
+    /// `libc::RENAME_WHITEOUT`. If `libc::RENAME_NOREPLACE` is specified, the
+    /// implementation must not overwrite `newname` if it exists and must return an error instead.
+    /// If `libc::RENAME_EXCHANGE` is specified, the implementation must atomically exchange the
+    /// two files, i.e., both must exist and neither may be deleted. If
+    /// `libc::RENAME_WHITEOUT` is specified, the implementation must, in addition to the rename,
+    /// leave a char device with device number 0/0 at `oldname`: that whiteout is what an overlayfs
+    /// upper layer is built from, and its mount-time probe rejects an upper (or workdir) that
+    /// cannot produce one. An implementation that cannot create it must fail the request with
+    /// `-EINVAL` - the error a filesystem without whiteout support returns - instead of falling
+    /// back to a plain rename, which would silently drop the whiteout.
+    ///
+    /// The default implementation returns `-ENOSYS` for every request.
     fn rename(
         &self,
         ctx: Context,

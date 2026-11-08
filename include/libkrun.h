@@ -720,8 +720,8 @@ typedef void (*krun_vsock_device_destroy_fn)(KrunVsockDevice handle);
  * Create a new block device.
  *
  * Defaults to read-write (`read_only = false`), cached I/O (`direct_io = false`),
- * [`SyncMode::Relaxed`], parallel reads (`parallel_reads = true`), and serialized writes
- * (`parallel_writes = false`).
+ * [`SyncMode::Relaxed`], and parallel reads and writes (`parallel_reads = true`,
+ * `parallel_writes = true`).
  */
 KrunBlockDevice krun_block_device_new(KrunStr id, KrunStr disk_image_path, uint32_t format, KrunError* err_out);
 typedef KrunBlockDevice (*krun_block_device_new_fn)(KrunStr id, KrunStr disk_image_path, uint32_t format, KrunError* err_out);
@@ -742,8 +742,8 @@ typedef void (*krun_block_device_set_sync_mode_fn)(KrunBlockDevice handle, uint3
 /**
  * Serve guest reads on a host thread pool with out-of-order completion.
  *
- * Enabled by default. Flushes and discards stay on the device thread, and so do writes
- * unless [`set_parallel_writes`](Self::set_parallel_writes) is enabled.
+ * Enabled by default, as are writes: see [`set_parallel_writes`](Self::set_parallel_writes).
+ * Flushes and discards stay on the device thread.
  * The pool size is automatic unless overridden with [`set_pool_size`](Self::set_pool_size).
  */
 void krun_block_device_set_parallel_reads(KrunBlockDevice handle, bool enabled);
@@ -761,7 +761,7 @@ typedef void (*krun_block_device_set_pool_size_fn)(KrunBlockDevice handle, size_
  * Serve guest writes on a host thread pool with out-of-order completion, straight from the
  * guest's buffers.
  *
- * Disabled by default. The pool is shared with parallel reads, and sized by
+ * Enabled by default. The pool is shared with parallel reads, and sized by
  * [`set_pool_size`](Self::set_pool_size). Flushes, discards, and write-zeroes wait for the
  * I/O in flight on the pool before they run.
  */

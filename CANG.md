@@ -1,20 +1,28 @@
 # cang downstream libkrun branch
 
 Based on upstream `main` - the 2.0.0 / C-ABI-2 line - as of
-`a0375321bb1e6e51312e022af53e9e7668d3a07e` (2026-10-29). The previous base was
+`2fc56b5b6fcef00fc327768c8bbd692cf90b03df` (2026-11-08). The previous base was
+`a0375321bb1e6e51312e022af53e9e7668d3a07e`, before that
 `a1d8616765da03980f3be1bb8714bfdd3842f33c`, and before the ABI-2 switch,
 upstream release `v1.19.5` (the `stable-1.19.x` line).
 
 ## Carried from upstream, still unmerged
 
-One open upstream PR is cherry-picked on top of the base, as its own commit with
-a `(cherry picked from upstream PR #N ...)` trailer so it can be dropped the day
-upstream merges it:
+Open upstream PRs are cherry-picked on top of the base, each as its own commits
+with a `(cherry picked from upstream PR #N ...)` trailer so they can be dropped
+the day upstream merges them:
 
 - PR 840 - guest-clock workarounds
+- PR 960 - virtio/blk: serve writes on the parallel I/O pool. Three commits: take
+  the disk image lock shared rather than exclusively for writes, write-zeroes and
+  flushes; rename the read pool to the I/O pool (`set_read_pool_size` becomes
+  `set_pool_size`); and add `set_parallel_writes`, which is what puts writes on
+  that pool. The fork keeps reads on the pool by default and leaves writes to the
+  opt-in, so cang's `set_parallel_reads(true)` call is unaffected.
 
-PR 865 (virtio/blk parallel reads with an auto-sized, overridable read pool,
-`krun_block_device_set_read_pool_size`) is merged upstream and part of the base,
+PR 865 (virtio/blk parallel reads with an auto-sized, overridable I/O pool,
+`krun_block_device_set_pool_size` once PR 960's rename is on top) is merged
+upstream and part of the base,
 so its three cherry-picks are gone. The fork keeps only the default flip:
 `parallel_reads = true` in `BlockDevice::new`, so a caller that never touches
 `set_parallel_reads` still gets the thread pool. Because that default is a
@@ -23,11 +31,15 @@ one-line fork commit, a caller that must not depend on it - cang's
 being dropped.
 
 Upstream PR 822 (virtio-gpu `CREATE_GUEST_HANDLE`, the zero-copy SHM fast path)
-is deliberately **not** carried: the path is inert on the pinned kernel, the PR's
-own commit renumbers `VIRTIO_GPU_F_CREATE_GUEST_HANDLE` from 6 to 5 while our
-kernel uses bit 5 for `VIRTIO_GPU_F_FENCE_PASSING`, and its rutabaga half needs
-crate support (guest-blob handles) that crates.io `rutabaga_gfx` 0.1.85 does not
-have.
+is carried behind a gate, not as the PR: upstream's own design is used and the
+PR's three component-routing hunks are dropped. `GpuDevice::set_zero_copy_shm`
+probes `/dev/udmabuf`; only when the probe succeeds does the device advertise
+`VIRTIO_GPU_F_CREATE_GUEST_HANDLE` (bit 6, upstream's numbering - the PR's own
+renumber to 5 collides with `VIRTIO_GPU_F_FENCE_PASSING`) and does
+`create_guest_memory` file-back guest RAM. The guest pages of an imported dma-buf
+become a udmabuf and reach rutabaga on the cross-domain context path, which is
+why `rutabaga_gfx` is a rev pin on the `zeroqn` fork rather than crates.io
+`0.1.85`.
 
 ## Fork-only work
 

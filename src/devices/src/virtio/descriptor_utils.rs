@@ -188,6 +188,47 @@ pub struct Reader<'a> {
     buffer: DescriptorChainConsumer<'a>,
 }
 
+/// Split one descriptor buffer into the guest-memory regions it covers.
+///
+/// A descriptor's buffer is contiguous in *guest physical* address space, but
+/// the guest-memory map is built from several regions: RAM below the 32-bit
+/// MMIO hole, the kernel image the firmware loader inserts, RAM above 4 GiB and
+/// the shared-memory windows. A guest driver is free to hand over a buffer that
+/// spans two adjacent regions (the guest cannot see the host's region split, so
+/// a multi-page scatter-gather entry covering, say, the tail of the kernel
+/// image and the RAM after it is legitimate), and rejecting such a chain drops
+/// a whole read or write: the request completes with no data and the guest's
+/// virtio-blk driver treats that as success.
+///
+/// Return one slice per covered region instead, so a buffer that fits in a
+/// single region yields exactly one slice, as before.
+fn buffer_region_slices<'a>(
+    mem: &'a GuestMemoryMmap,
+    addr: GuestAddress,
+    len: u32,
+) -> Result<Vec<VolatileSlice<'a>>> {
+    let mut slices = Vec::new();
+    let mut cursor = addr;
+    let mut remaining = len as usize;
+
+    while remaining > 0 {
+        let region = mem.find_region(cursor).ok_or(Error::FindMemoryRegion)?;
+        let region_start = region.start_addr().raw_value();
+        let room = (region_start + region.len() - cursor.raw_value()).min(remaining as u64);
+        let offset = cursor.raw_value() - region_start;
+        slices.push(
+            region
+                .deref()
+                .get_slice(offset as usize, room as usize)
+                .map_err(Error::VolatileMemoryError)?,
+        );
+        cursor = GuestAddress(cursor.raw_value() + room);
+        remaining -= room as usize;
+    }
+
+    Ok(slices)
+}
+
 impl<'a> Reader<'a> {
     /// Construct a new Reader wrapper over `desc_chain`.
     pub fn new(mem: &'a GuestMemoryMmap, chain: DescriptorChain<'a>) -> Result<Reader<'a>> {
@@ -216,14 +257,12 @@ impl<'a> Reader<'a> {
                     .checked_add(len as usize)
                     .ok_or(Error::DescriptorChainOverflow)?;
 
-                let region = mem.find_region(addr).ok_or(Error::FindMemoryRegion)?;
-                let offset = addr.checked_sub(region.start_addr().raw_value()).unwrap();
-                region
-                    .deref()
-                    .get_slice(offset.raw_value() as usize, len as usize)
-                    .map_err(Error::VolatileMemoryError)
+                buffer_region_slices(mem, addr, len)
             })
-            .collect::<Result<VecDeque<VolatileSlice<'a>>>>()?;
+            .collect::<Result<Vec<Vec<VolatileSlice<'a>>>>>()?
+            .into_iter()
+            .flatten()
+            .collect::<VecDeque<VolatileSlice<'a>>>();
         Ok(Reader {
             buffer: DescriptorChainConsumer {
                 buffers,
@@ -378,14 +417,12 @@ impl<'a> Writer<'a> {
                     .checked_add(len as usize)
                     .ok_or(Error::DescriptorChainOverflow)?;
 
-                let region = mem.find_region(addr).ok_or(Error::FindMemoryRegion)?;
-                let offset = addr.checked_sub(region.start_addr().raw_value()).unwrap();
-                region
-                    .deref()
-                    .get_slice(offset.raw_value() as usize, len as usize)
-                    .map_err(Error::VolatileMemoryError)
+                buffer_region_slices(mem, addr, len)
             })
-            .collect::<Result<VecDeque<VolatileSlice<'a>>>>()?;
+            .collect::<Result<Vec<Vec<VolatileSlice<'a>>>>>()?
+            .into_iter()
+            .flatten()
+            .collect::<VecDeque<VolatileSlice<'a>>>();
 
         Ok(Writer {
             buffer: DescriptorChainConsumer {
@@ -557,6 +594,60 @@ pub fn create_descriptor_chain(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // A descriptor buffer is contiguous in guest physical address space, but the
+    // guest-memory map is not: RAM below the MMIO hole, the kernel image the
+    // firmware loader inserts and RAM above 4 GiB are separate regions. A guest
+    // driver that hands over one buffer spanning such a boundary is legal (it
+    // cannot see the host's split), and rejecting it dropped a whole virtio-blk
+    // request, which the guest then treated as a successful, dataless read.
+    #[test]
+    fn buffers_spanning_two_regions_are_split_not_rejected() {
+        // Two adjacent regions with a boundary at 0x2000, as the kernel-image
+        // region and the RAM after it are.
+        let memory = GuestMemoryMmap::from_ranges(&[
+            (GuestAddress(0x1000), 0x1000),
+            (GuestAddress(0x2000), 0x1000),
+        ])
+        .unwrap();
+
+        let mut reader =
+            Reader::from_guest_buffers(&memory, [(GuestAddress(0x1800), 0x1000)]).expect("reader");
+        assert_eq!(reader.available_bytes(), 0x1000);
+
+        // The bytes on either side of the boundary are distinct, so a read that
+        // crossed it with the wrong slice count would read the wrong page.
+        memory
+            .write_slice(&[0xaa_u8; 0x800], GuestAddress(0x1800))
+            .unwrap();
+        memory
+            .write_slice(&[0xbb_u8; 0x800], GuestAddress(0x2000))
+            .unwrap();
+        let mut buffer = [0_u8; 0x1000];
+        reader.read_exact(&mut buffer).expect("read_exact");
+        assert_eq!(&buffer[..0x800], &[0xaa_u8; 0x800]);
+        assert_eq!(&buffer[0x800..], &[0xbb_u8; 0x800]);
+
+        let mut writer =
+            Writer::from_guest_buffers(&memory, [(GuestAddress(0x1800), 0x1000)]).expect("writer");
+        assert_eq!(writer.available_bytes(), 0x1000);
+        writer.write_all(&[0xcc_u8; 0x1000]).expect("write_all");
+        assert_eq!(writer.available_bytes(), 0);
+
+        let mut check = [0_u8; 0x1000];
+        memory.read_slice(&mut check, GuestAddress(0x1800)).unwrap();
+        assert_eq!(check, [0xcc_u8; 0x1000]);
+    }
+
+    #[test]
+    fn buffers_inside_one_region_keep_one_slice() {
+        let memory = GuestMemoryMmap::from_ranges(&[(GuestAddress(0x1000), 0x1000)]).unwrap();
+
+        let reader =
+            Reader::from_guest_buffers(&memory, [(GuestAddress(0x1800), 0x100)]).expect("reader");
+        assert_eq!(reader.available_bytes(), 0x100);
+        assert_eq!(reader.buffer.buffers.len(), 1);
+    }
 
     #[test]
     fn reader_test_simple_chain() {

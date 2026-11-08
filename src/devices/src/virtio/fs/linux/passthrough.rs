@@ -1348,10 +1348,10 @@ impl FileSystem for PassthroughFs {
             let err = io::Error::last_os_error();
             // A name that is not there: answer with the cacheable negative entry
             // rather than `-ENOENT`, so a repeated probe costs nothing.
-            if err.raw_os_error() == Some(libc::ENOENT) {
-                if let Some(timeout) = self.cfg.negative_entry {
-                    return Ok(negative_entry(timeout));
-                }
+            if err.raw_os_error() == Some(libc::ENOENT)
+                && let Some(timeout) = self.cfg.negative_entry
+            {
+                return Ok(negative_entry(timeout));
             }
             return Err(err);
         }

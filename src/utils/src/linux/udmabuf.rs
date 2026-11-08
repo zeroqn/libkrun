@@ -175,7 +175,9 @@ impl UdmabufDriver {
 
             let offset = file_offset.start() + map_offset.0;
 
-            if offset as usize % self.page_size != 0 || len % self.page_size != 0 {
+            if !(offset as usize).is_multiple_of(self.page_size)
+                || !len.is_multiple_of(self.page_size)
+            {
                 return Err(UdmabufError::NotPageAligned);
             }
 

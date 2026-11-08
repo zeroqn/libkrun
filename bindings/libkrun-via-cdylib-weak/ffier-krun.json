@@ -2231,8 +2231,8 @@
             " Create a new block device.",
             "",
             " Defaults to read-write (`read_only = false`), cached I/O (`direct_io = false`),",
-            " [`SyncMode::Relaxed`], parallel reads (`parallel_reads = true`), and serialized",
-            " writes (`parallel_writes = false`)."
+            " [`SyncMode::Relaxed`], parallel reads (`parallel_reads = true`), and serialized writes",
+            " (`parallel_writes = false`)."
           ],
           "receiver": "none",
           "params": [

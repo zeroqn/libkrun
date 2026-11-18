@@ -6,13 +6,12 @@ use crate::virtio::DescriptorChain;
 
 use crate::virtio::InterruptTransport;
 use crossbeam_channel::{Receiver, Sender, unbounded};
-use std::collections::TryReserveError;
+use std::collections::HashMap;
 use std::io::{self, Write};
 use std::num::NonZeroUsize;
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
 use std::result;
-use std::sync::Mutex;
 use std::thread::{self, JoinHandle};
 use utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
 use utils::eventfd::{EFD_NONBLOCK, EventFd};
@@ -66,15 +65,16 @@ unsafe impl ByteValued for DiscardWriteData {}
 #[derive(Debug)]
 struct ReadJob {
     head_index: u16,
+    /// Distinguishes in-flight reads for the overlap bookkeeping below.
+    id: u64,
     sector: u64,
     data_len: usize,
     buffers: Vec<(GuestAddress, u32)>,
-    _buffer_permit: ReadBufferPermit,
 }
 
 struct ReadCompletion {
     job: ReadJob,
-    data: Option<Vec<u8>>,
+    ok: bool,
 }
 
 /// A write served by the pool: the data is written to the image straight
@@ -105,26 +105,45 @@ enum PoolCompletion {
     Write(WriteCompletion),
 }
 
-// Aliased guest descriptors can make a read's total length exceed guest RAM and exhaust host memory.
-const PARALLEL_READ_BUFFER_BUDGET_BYTES: usize = 64 * 1024 * 1024;
-
-static AVAILABLE_READ_BUFFER_BYTES: Mutex<usize> = Mutex::new(PARALLEL_READ_BUFFER_BUDGET_BYTES);
-
-#[derive(Debug)]
-struct ReadBufferPermit(usize);
-
-impl ReadBufferPermit {
-    fn try_acquire(bytes: usize) -> Option<Self> {
-        let mut available = AVAILABLE_READ_BUFFER_BYTES.lock().unwrap();
-        *available = available.checked_sub(bytes)?;
-        Some(Self(bytes))
-    }
+/// pread the image at `offset` straight into a writer that targets guest memory.
+///
+/// This is the same call the serial path makes on the device thread
+/// (`Writer::write_from_at`); the only difference here is which thread runs it, which is
+/// why the dispatcher admits a pooled read only when its guest ranges are disjoint from
+/// every other request already in flight.
+fn read_into_guest(
+    writer: &mut Writer<'_>,
+    disk: &DiskProperties,
+    count: usize,
+    offset: u64,
+) -> io::Result<usize> {
+    writer.write_from_at(disk, count, offset)
 }
 
-impl Drop for ReadBufferPermit {
-    fn drop(&mut self) {
-        *AVAILABLE_READ_BUFFER_BYTES.lock().unwrap() += self.0;
-    }
+/// Read guest memory ranges for one request, as `(start, len)`.
+fn guest_ranges(buffers: &[(GuestAddress, u32)]) -> Vec<(u64, u64)> {
+    buffers
+        .iter()
+        .map(|(addr, len)| (addr.0, *len as u64))
+        .collect()
+}
+
+/// Whether two requests write any of the same guest memory.
+///
+/// A pooled read writes the data straight into the guest's descriptor buffers, which is
+/// only safe while no other in-flight read (or serial request) writes the same bytes.
+/// The virtio contract says a driver must not post overlapping buffers for requests that
+/// are in flight together, but a guest can still do it, so the dispatcher admits a read
+/// only when its ranges are disjoint from everything already in flight and defers it
+/// otherwise.
+fn ranges_overlap(a: &[(u64, u64)], b: &[(u64, u64)]) -> bool {
+    a.iter().any(|&(a_start, a_len)| {
+        let a_end = a_start.saturating_add(a_len);
+        b.iter().any(|&(b_start, b_len)| {
+            let b_end = b_start.saturating_add(b_len);
+            a_start < b_end && b_start < a_end
+        })
+    })
 }
 
 struct IoPool {
@@ -172,25 +191,34 @@ impl IoPool {
                                     continue;
                                 }
                             };
-                            let data = (|| {
-                                let mut data =
-                                    allocate_read_buffer(job.data_len).map_err(io::Error::other)?;
+                            let ok = (|| {
+                                let mut writer = Writer::from_guest_buffers(
+                                    &mem,
+                                    job.buffers.iter().copied(),
+                                )
+                                .map_err(io::Error::other)?;
+                                // `split_at` returns the remainder, so the receiver keeps the
+                                // data region and the status byte stays outside it - the same
+                                // arrangement the serial path makes.
+                                writer
+                                    .split_at(job.data_len)
+                                    .map_err(io::Error::other)?;
                                 let offset = job
                                     .sector
                                     .checked_mul(512)
                                     .ok_or_else(|| io::Error::other("invalid read sector"))?;
-                                disk.read().unwrap().read(&mut data, offset)?;
-                                Ok::<_, io::Error>(data)
+                                read_into_guest(&mut writer, &properties, job.data_len, offset)
+                                    .map(|_| ())
                             })();
-                            let data = match data {
-                                Ok(data) => Some(data),
+                            let ok = match ok {
+                                Ok(()) => true,
                                 Err(e) => {
                                     error!("error processing read request: {e:?}");
-                                    None
+                                    false
                                 }
                             };
                             if tx
-                                .send(PoolCompletion::Read(ReadCompletion { job, data }))
+                                .send(PoolCompletion::Read(ReadCompletion { job, ok }))
                                 .is_err()
                             {
                                 return;
@@ -226,12 +254,6 @@ impl Drop for IoPool {
 
 // Keep allocation fallible because the size comes from guest descriptors.
 #[allow(clippy::slow_vector_initialization)]
-fn allocate_read_buffer(len: usize) -> result::Result<Vec<u8>, TryReserveError> {
-    let mut buffer = Vec::new();
-    buffer.try_reserve_exact(len)?;
-    buffer.resize(len, 0);
-    Ok(buffer)
-}
 
 fn write_from_guest(mem: &GuestMemoryMmap, disk: &DiskProperties, job: &WriteJob) -> bool {
     let result = (|| {
@@ -298,15 +320,12 @@ fn write_read_completion(mem: &GuestMemoryMmap, completion: ReadCompletion) -> (
         }
     };
 
-    let (status, len): (u8, usize) = match completion.data {
-        Some(data) => match writer.write_all(&data) {
-            Ok(()) => (VIRTIO_BLK_S_OK.try_into().unwrap(), data.len()),
-            Err(e) => {
-                error!("failed to copy read data to guest memory: {e:?}");
-                (VIRTIO_BLK_S_IOERR.try_into().unwrap(), 0)
-            }
-        },
-        None => (VIRTIO_BLK_S_IOERR.try_into().unwrap(), 0),
+    // The data is already in the guest's buffers - a pool worker pread into them - so
+    // only the status byte is left to write here.
+    let (status, len): (u8, usize) = if completion.ok {
+        (VIRTIO_BLK_S_OK.try_into().unwrap(), completion.job.data_len)
+    } else {
+        (VIRTIO_BLK_S_IOERR.try_into().unwrap(), 0)
     };
 
     let status_len = match status_writer.write_obj(status) {
@@ -329,6 +348,9 @@ pub struct BlockWorker {
     parallel_reads: bool,
     parallel_writes: bool,
     pool_size: Option<NonZeroUsize>,
+    /// Guest ranges written by reads that are in flight in the pool, keyed by job id.
+    inflight_read_ranges: HashMap<u64, Vec<(u64, u64)>>,
+    next_read_id: u64,
 }
 
 impl BlockWorker {
@@ -352,6 +374,8 @@ impl BlockWorker {
             parallel_reads,
             parallel_writes,
             pool_size,
+            inflight_read_ranges: HashMap::new(),
+            next_read_id: 0,
         }
     }
 
@@ -465,10 +489,45 @@ impl BlockWorker {
         }
     }
 
+    /// Forget the guest ranges of a read that has finished.
+    fn retire_read(&mut self, completion: &PoolCompletion) {
+        if let PoolCompletion::Read(read) = completion {
+            self.inflight_read_ranges.remove(&read.job.id);
+        }
+    }
+
+    /// Block until no in-flight read writes any of `ranges`.
+    ///
+    /// Returns `false` only if the pool stops making progress, in which case the caller
+    /// serves the request on this thread instead.
+    fn wait_until_read_ranges_are_free(&mut self, pool: &mut IoPool, ranges: &[(u64, u64)]) -> bool {
+        loop {
+            let clash = self
+                .inflight_read_ranges
+                .values()
+                .any(|inflight| ranges_overlap(inflight, ranges));
+            if !clash {
+                return true;
+            }
+            if pool.pending == 0 {
+                return false;
+            }
+            let Ok(completion) = pool.completions.recv() else {
+                return false;
+            };
+            pool.pending -= 1;
+            self.retire_read(&completion);
+            let (head, len) = write_completion(&self.mem, completion);
+            self.add_used(head, len);
+            self.signal_used_queue();
+        }
+    }
+
     fn process_pool_completions(&mut self, pool: &mut IoPool) {
         let pending = pool.pending;
         for completion in pool.completions.try_iter() {
             pool.pending -= 1;
+            self.retire_read(&completion);
             let (head, len) = write_completion(&self.mem, completion);
             self.add_used(head, len);
         }
@@ -483,6 +542,7 @@ impl BlockWorker {
         while pool.pending > 0 {
             let completion = pool.completions.recv().unwrap();
             pool.pending -= 1;
+            self.retire_read(&completion);
             let (head, len) = write_completion(&self.mem, completion);
             self.add_used(head, len);
         }
@@ -563,6 +623,7 @@ impl BlockWorker {
             if pool.pending == pool.workers.len() {
                 let completion = pool.completions.recv().unwrap();
                 pool.pending -= 1;
+                self.retire_read(&completion);
                 let (head, len) = write_completion(mem, completion);
                 self.add_used(head, len);
                 self.signal_used_queue();
@@ -575,21 +636,28 @@ impl BlockWorker {
                 );
                 return;
             }
-            if let Some(permit) = ReadBufferPermit::try_acquire(data_len) {
+            let ranges = guest_ranges(&buffers);
+            if self.wait_until_read_ranges_are_free(pool, &ranges) {
+                let id = self.next_read_id;
+                self.next_read_id += 1;
+                self.inflight_read_ranges.insert(id, ranges);
                 pool.jobs
                     .as_ref()
                     .unwrap()
                     .send(PoolJob::Read(ReadJob {
                         head_index,
+                        id,
                         sector: request_header.sector,
                         data_len,
                         buffers,
-                        _buffer_permit: permit,
                     }))
                     .unwrap();
                 pool.pending += 1;
                 return;
             }
+            // The pool never drained: fall through to the serial path, which writes the
+            // same guest memory from this thread.
+            debug!("pool reads still overlapping; serving this read serially");
         } else if request_header.request_type == VIRTIO_BLK_T_OUT
             && self.parallel_writes
             && let Some(pool) = pool
@@ -598,6 +666,7 @@ impl BlockWorker {
             if pool.pending == pool.workers.len() {
                 let completion = pool.completions.recv().unwrap();
                 pool.pending -= 1;
+                self.retire_read(&completion);
                 let (head, len) = write_completion(mem, completion);
                 self.add_used(head, len);
                 self.signal_used_queue();
@@ -825,6 +894,77 @@ mod tests {
         assert_eq!(epoll.wait(1, 1000, &mut events).unwrap(), 1);
     }
 
+
+    #[test]
+    fn pooled_reads_write_straight_into_guest_memory() {
+        // The pool must pread into the guest's own buffers: no staging buffer, no copy.
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x4000)]).unwrap();
+        let queue = VirtQueue::new(GuestAddress(0), &mem, 16);
+        let head = create_descriptor_chain(
+            &mem,
+            GuestAddress(0),
+            GuestAddress(0x1000),
+            vec![
+                (DescriptorType::Readable, 16),
+                (DescriptorType::Writable, 512),
+                (DescriptorType::Writable, 1),
+            ],
+            0,
+        )
+        .unwrap();
+        mem.write_obj(
+            RequestHeader {
+                request_type: VIRTIO_BLK_T_IN,
+                sector: 0,
+                ..Default::default()
+            },
+            GuestAddress(0x1000),
+        )
+        .unwrap();
+        let data_addr = GuestAddress(0x1010);
+        let status_addr = GuestAddress(0x1210);
+        mem.write_slice(&[0xaa; 512], data_addr).unwrap();
+
+        let mut worker = BlockWorker::new(
+            DeviceQueue::new(
+                queue.create_queue(),
+                Arc::new(EventFd::new(EFD_NONBLOCK).unwrap()),
+            ),
+            InterruptTransport::new(DummyIrqChip::new().into(), "block test".into()).unwrap(),
+            mem.clone(),
+            test_disk(false),
+            EventFd::new(EFD_NONBLOCK).unwrap(),
+            true,
+            false,
+            None,
+        );
+        let mut pool = IoPool::new(1, &worker.disk, &mem);
+        worker.dispatch_request(&mem, Some(&mut pool), head);
+        assert_eq!(pool.pending, 1, "the read must be handed to the pool");
+
+        wait_for_completion(&pool);
+        worker.process_pool_completions(&mut pool);
+
+        let mut data = [0u8; 512];
+        mem.read_slice(&mut data, data_addr).unwrap();
+        assert_eq!(data, [0x11; 512], "the pool worker must write the guest's buffers");
+        assert_eq!(mem.read_obj::<u8>(status_addr).unwrap(), VIRTIO_BLK_S_OK as u8);
+    }
+
+
+    #[test]
+    fn overlapping_guest_read_ranges_are_detected() {
+        // Disjoint: two halves of one buffer, and a neighbouring buffer.
+        assert!(!ranges_overlap(&[(0x1000, 512)], &[(0x1200, 512)]));
+        assert!(!ranges_overlap(&[(0x1000, 512)], &[(0x2000, 16)]));
+        // Overlapping: a shared byte, a containing range, and an identical range.
+        assert!(ranges_overlap(&[(0x1000, 512)], &[(0x11ff, 512)]));
+        assert!(ranges_overlap(&[(0x1000, 1024)], &[(0x1200, 16)]));
+        assert!(ranges_overlap(&[(0x1000, 512)], &[(0x1000, 512)]));
+        // Empty ranges never clash.
+        assert!(!ranges_overlap(&[], &[(0x1000, 512)]));
+    }
+
     #[test]
     fn serialized_and_fallback_reads_keep_status_outside_data() {
         for (parallel, data_len, sector, status, used_len) in [
@@ -832,13 +972,7 @@ mod tests {
             (false, 512, u64::MAX, VIRTIO_BLK_S_IOERR, 1),
             (true, 512, 0, VIRTIO_BLK_S_OK, 513),
             (true, 512, u64::MAX, VIRTIO_BLK_S_IOERR, 1),
-            (
-                true,
-                PARALLEL_READ_BUFFER_BUDGET_BYTES + 512,
-                u64::MAX,
-                VIRTIO_BLK_S_IOERR,
-                1,
-            ),
+            (true, 512, u64::MAX, VIRTIO_BLK_S_IOERR, 1),
             (true, 511, 0, VIRTIO_BLK_S_IOERR, 1),
         ] {
             let mem =
@@ -908,23 +1042,26 @@ mod tests {
     }
 
     #[test]
-    fn pool_wakes_dispatcher_and_drains_overlapping_reads_on_drop() {
+    fn pooled_reads_drain_on_drop_and_keep_their_own_buffers() {
+        // Disjoint guest buffers: the pool may run both at once, and each must land in its
+        // own region with only the status byte written by the completion path.
         for direct_io in [false, true] {
             let disk = test_disk(direct_io);
             let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x1000)]).unwrap();
             mem.write_slice(&[0xff; 513], GuestAddress(0x100)).unwrap();
+            mem.write_slice(&[0xff; 513], GuestAddress(0x400)).unwrap();
             let mut pool = IoPool::new(2, &disk, &mem);
             let completions = pool.completions.clone();
-            for sector in 0..2 {
+            for (sector, addr) in [(0u64, 0x100u64), (1, 0x400)] {
                 pool.jobs
                     .as_ref()
                     .unwrap()
                     .send(PoolJob::Read(ReadJob {
                         head_index: sector as u16,
+                        id: sector,
                         sector,
                         data_len: 512,
-                        buffers: vec![(GuestAddress(0x100), 513)],
-                        _buffer_permit: ReadBufferPermit::try_acquire(512).unwrap(),
+                        buffers: vec![(GuestAddress(addr), 513)],
                     }))
                     .unwrap();
             }
@@ -932,9 +1069,6 @@ mod tests {
             pool.jobs.take();
             drop(pool);
 
-            let mut data = [0; 513];
-            mem.read_slice(&mut data, GuestAddress(0x100)).unwrap();
-            assert_eq!(data, [0xff; 513]);
             let mut completed = 0;
             for completion in completions.try_iter() {
                 let PoolCompletion::Read(completion) = completion else {
@@ -942,14 +1076,79 @@ mod tests {
                 };
                 let head = completion.job.head_index;
                 assert_eq!(write_read_completion(&mem, completion), (head, 513));
-                mem.read_slice(&mut data, GuestAddress(0x100)).unwrap();
-                assert_eq!(&data[..512], &[if head == 0 { 0x11 } else { 0x22 }; 512]);
+                let addr = if head == 0 { 0x100 } else { 0x400 };
+                let mut data = [0; 513];
+                mem.read_slice(&mut data, GuestAddress(addr)).unwrap();
+                assert_eq!(
+                    &data[..512],
+                    &[if head == 0 { 0x11 } else { 0x22 }; 512],
+                    "each pooled read must fill its own guest buffers"
+                );
                 assert_eq!(data[512], VIRTIO_BLK_S_OK as u8);
                 completed += 1;
             }
             assert_eq!(completed, 2);
             assert!(completions.recv().is_err());
         }
+    }
+
+    #[test]
+    fn overlapping_pooled_reads_are_admitted_one_at_a_time() {
+        // Two reads aimed at the same guest bytes must not run concurrently: the dispatcher
+        // admits one and defers the other until the first has retired.
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x4000)]).unwrap();
+        let queue = VirtQueue::new(GuestAddress(0), &mem, 16);
+        let mut heads = Vec::new();
+        for sector in 0..2u64 {
+            let head = create_descriptor_chain(
+                &mem,
+                GuestAddress(0),
+                GuestAddress(0x1000),
+                vec![
+                    (DescriptorType::Readable, 16),
+                    (DescriptorType::Writable, 512),
+                    (DescriptorType::Writable, 1),
+                ],
+                0,
+            )
+            .unwrap();
+            mem.write_obj(
+                RequestHeader {
+                    request_type: VIRTIO_BLK_T_IN,
+                    sector,
+                    ..Default::default()
+                },
+                GuestAddress(0x1000),
+            )
+            .unwrap();
+            heads.push(head);
+        }
+        let mut worker = BlockWorker::new(
+            DeviceQueue::new(
+                queue.create_queue(),
+                Arc::new(EventFd::new(EFD_NONBLOCK).unwrap()),
+            ),
+            InterruptTransport::new(DummyIrqChip::new().into(), "block test".into()).unwrap(),
+            mem.clone(),
+            test_disk(false),
+            EventFd::new(EFD_NONBLOCK).unwrap(),
+            true,
+            false,
+            None,
+        );
+        let mut pool = IoPool::new(1, &worker.disk, &mem);
+        worker.dispatch_request(&mem, Some(&mut pool), heads.remove(0));
+        assert_eq!(pool.pending, 1, "the first read goes to the pool");
+        assert_eq!(worker.inflight_read_ranges.len(), 1);
+        // The second overlaps the first, so it is served only after that one retires; it
+        // must not leave two entries in flight over the same bytes.
+        worker.dispatch_request(&mem, Some(&mut pool), heads.remove(0));
+        assert_eq!(
+            worker.inflight_read_ranges.len(),
+            1,
+            "at most one read may own the overlapping range"
+        );
+        assert_eq!(pool.pending, 1, "the deferred read replaced the retired one");
     }
 
     #[test]
@@ -1072,15 +1271,6 @@ mod tests {
     }
 
     #[test]
-    fn read_buffer_budget_rejects_oversized_parallel_reads() {
-        assert!(ReadBufferPermit::try_acquire(PARALLEL_READ_BUFFER_BUDGET_BYTES + 1).is_none());
-        let permit = ReadBufferPermit::try_acquire(63 * 1024 * 1024).unwrap();
-        assert!(ReadBufferPermit::try_acquire(2 * 1024 * 1024).is_none());
-        drop(permit);
-        assert!(ReadBufferPermit::try_acquire(2 * 1024 * 1024).is_some());
-    }
-
-    #[test]
     fn explicit_pool_size_requires_enough_available_parallelism() {
         assert_eq!(resolve_pool_size(NonZeroUsize::new(4), Some(4)), Some(4));
         assert_eq!(resolve_pool_size(NonZeroUsize::new(5), Some(4)), None);
@@ -1095,9 +1285,8 @@ mod tests {
     }
 
     #[test]
-    fn read_completion_uses_snapshot_and_copies_data_before_status() {
+    fn read_completion_writes_only_status_and_reports_the_data_length() {
         let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
-        let permit = ReadBufferPermit::try_acquire(4).unwrap();
         let chain = create_descriptor_chain(
             &mem,
             GuestAddress(0),
@@ -1112,18 +1301,22 @@ mod tests {
             .map(|desc| (desc.addr, desc.len))
             .collect();
         mem.write_slice(&[0; 32], GuestAddress(0)).unwrap();
+        // The pool worker has already pread into the data region; the completion must not
+        // touch it and must report data length + status byte as used.
+        mem.write_slice(&[0x11, 0x22, 0x33, 0x44], GuestAddress(0x108))
+            .unwrap();
 
         let used = write_read_completion(
             &mem,
             ReadCompletion {
                 job: ReadJob {
                     head_index: 0,
+                    id: 0,
                     sector: 0,
                     data_len: 4,
                     buffers,
-                    _buffer_permit: permit,
                 },
-                data: Some(vec![0x11, 0x22, 0x33, 0x44]),
+                ok: true,
             },
         );
 
@@ -1162,12 +1355,12 @@ mod tests {
             ReadCompletion {
                 job: ReadJob {
                     head_index: 0,
+                    id: 0,
                     sector: 0,
                     data_len: 4,
                     buffers,
-                    _buffer_permit: ReadBufferPermit::try_acquire(4).unwrap(),
                 },
-                data: None,
+                ok: false,
             },
         );
 

@@ -192,17 +192,13 @@ impl IoPool {
                                 }
                             };
                             let ok = (|| {
-                                let mut writer = Writer::from_guest_buffers(
-                                    &mem,
-                                    job.buffers.iter().copied(),
-                                )
-                                .map_err(io::Error::other)?;
+                                let mut writer =
+                                    Writer::from_guest_buffers(&mem, job.buffers.iter().copied())
+                                        .map_err(io::Error::other)?;
                                 // `split_at` returns the remainder, so the receiver keeps the
                                 // data region and the status byte stays outside it - the same
                                 // arrangement the serial path makes.
-                                writer
-                                    .split_at(job.data_len)
-                                    .map_err(io::Error::other)?;
+                                writer.split_at(job.data_len).map_err(io::Error::other)?;
                                 let offset = job
                                     .sector
                                     .checked_mul(512)
@@ -500,7 +496,11 @@ impl BlockWorker {
     ///
     /// Returns `false` only if the pool stops making progress, in which case the caller
     /// serves the request on this thread instead.
-    fn wait_until_read_ranges_are_free(&mut self, pool: &mut IoPool, ranges: &[(u64, u64)]) -> bool {
+    fn wait_until_read_ranges_are_free(
+        &mut self,
+        pool: &mut IoPool,
+        ranges: &[(u64, u64)],
+    ) -> bool {
         loop {
             let clash = self
                 .inflight_read_ranges
@@ -894,7 +894,6 @@ mod tests {
         assert_eq!(epoll.wait(1, 1000, &mut events).unwrap(), 1);
     }
 
-
     #[test]
     fn pooled_reads_write_straight_into_guest_memory() {
         // The pool must pread into the guest's own buffers: no staging buffer, no copy.
@@ -947,10 +946,15 @@ mod tests {
 
         let mut data = [0u8; 512];
         mem.read_slice(&mut data, data_addr).unwrap();
-        assert_eq!(data, [0x11; 512], "the pool worker must write the guest's buffers");
-        assert_eq!(mem.read_obj::<u8>(status_addr).unwrap(), VIRTIO_BLK_S_OK as u8);
+        assert_eq!(
+            data, [0x11; 512],
+            "the pool worker must write the guest's buffers"
+        );
+        assert_eq!(
+            mem.read_obj::<u8>(status_addr).unwrap(),
+            VIRTIO_BLK_S_OK as u8
+        );
     }
-
 
     #[test]
     fn overlapping_guest_read_ranges_are_detected() {
@@ -1148,7 +1152,10 @@ mod tests {
             1,
             "at most one read may own the overlapping range"
         );
-        assert_eq!(pool.pending, 1, "the deferred read replaced the retired one");
+        assert_eq!(
+            pool.pending, 1,
+            "the deferred read replaced the retired one"
+        );
     }
 
     #[test]

@@ -511,15 +511,22 @@ impl FsWorker {
                                 self.handle_event(REQ_INDEX);
                             }
                             EventSet::IN if Some(source) == completion_ev_fd => {
-                                self.handle_completions();
+                                self.handle_completions(true);
                             }
                             EventSet::IN if source == stop_ev_fd => {
                                 debug!("stopping worker thread");
                                 let _ = self.stop_fd.read();
                                 // Drain what the pool already served before the
                                 // threads are joined, so a stopping share does
-                                // not drop replies the guest could still use.
-                                self.handle_completions();
+                                // not drop replies the guest could still use. The
+                                // completion eventfd is not necessarily signalled
+                                // here - it is level-triggered and only this
+                                // dispatcher consumes it - so the drain must not
+                                // read it: an unsignalled EFD_NONBLOCK read is
+                                // EWOULDBLOCK, which would be reported as a
+                                // teardown error on every VM that stops with a
+                                // pool.
+                                self.handle_completions(false);
                                 self.log_opcode_histogram();
                                 return;
                             }
@@ -583,11 +590,16 @@ impl FsWorker {
     }
 
     /// Publish every reply the pool has finished, in completion order.
-    fn handle_completions(&mut self) {
+    ///
+    /// `consume_event` says whether this call was woken by the completion
+    /// eventfd, which is the only moment the level-triggered count is there to
+    /// consume. A drain on any other account (the stop path) must not read it:
+    /// see the caller there.
+    fn handle_completions(&mut self, consume_event: bool) {
         let Some(pool) = self.pool.as_mut() else {
             return;
         };
-        if let Err(e) = pool.event.read() {
+        if consume_event && let Err(e) = pool.event.read() {
             error!("failed to consume the fuse completion event: {e:?}");
         }
         while let Ok(completion) = pool.completions.try_recv() {

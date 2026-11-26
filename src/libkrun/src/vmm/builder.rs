@@ -2948,9 +2948,18 @@ pub mod tests {
     #[cfg(all(target_os = "linux", not(feature = "tee")))]
     fn test_create_guest_memory_advises_huge_pages_only_when_asked() {
         for thp in [true, false] {
-            let (guest_memory, _info, _shm_manager, _payload_config) =
-                create_guest_memory(64, None, None, &[], None, false, &Payload::Empty, thp)
-                    .unwrap();
+            let (guest_memory, _info, _shm_manager, _payload_config) = create_guest_memory(
+                64,
+                None,
+                None,
+                &[],
+                None,
+                false,
+                false,
+                &Payload::Empty,
+                thp,
+            )
+            .unwrap();
             let smaps = std::fs::read_to_string("/proc/self/smaps").unwrap();
             for region in guest_memory.iter() {
                 let addr = region.as_ptr() as usize;

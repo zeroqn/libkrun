@@ -2176,8 +2176,6 @@ impl GpuDevice {
     /// `create_guest_memory` reads) one decision rather than two that can
     /// disagree. A host that cannot serve it keeps the copy path with a
     /// warning, rather than negotiating a feature it cannot honour.
-    #[cfg_attr(feature = "ffi", ffier::export(cfg = "feature = \"gpu\""))]
-    #[cfg_attr(not(feature = "ffi"), cfg(feature = "gpu"))]
     #[cfg(target_os = "linux")]
     pub fn set_zero_copy_shm(mut self, enable: bool) -> Self {
         if !enable {

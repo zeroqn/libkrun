@@ -1,8 +1,9 @@
 # cang downstream libkrun branch
 
 Based on upstream `main` - the 2.0.0 / C-ABI-2 line - as of
-`2fc56b5b6fcef00fc327768c8bbd692cf90b03df` (2026-11-08). The previous base was
-`a0375321bb1e6e51312e022af53e9e7668d3a07e`, before that
+`d3dc2a75bac6a0ac8e4047791e5ce5960bf289b6` (2026-11-25). The previous base was
+`2fc56b5b6fcef00fc327768c8bbd692cf90b03df` (2026-11-08), before that
+`a0375321bb1e6e51312e022af53e9e7668d3a07e`, then
 `a1d8616765da03980f3be1bb8714bfdd3842f33c`, and before the ABI-2 switch,
 upstream release `v1.19.5` (the `stable-1.19.x` line).
 
@@ -12,13 +13,23 @@ Open upstream PRs are cherry-picked on top of the base, each as its own commits
 with a `(cherry picked from upstream PR #N ...)` trailer so they can be dropped
 the day upstream merges them:
 
-- PR 840 - guest-clock workarounds
 - PR 960 - virtio/blk: serve writes on the parallel I/O pool. Three commits: take
   the disk image lock shared rather than exclusively for writes, write-zeroes and
   flushes; rename the read pool to the I/O pool (`set_read_pool_size` becomes
   `set_pool_size`); and add `set_parallel_writes`, which is what puts writes on
   that pool. The fork keeps reads on the pool by default and leaves writes to the
   opt-in, so cang's `set_parallel_reads(true)` call is unaffected.
+
+PR 840 (guest-clock workarounds: enable the timesync device for Linux, let a
+guest ask for an explicit sync, cut `DELTA_SYNC` to 10 ms, and build the init
+blob with the feature when `TIMESYNC=1`) is **not** carried: those four
+cherry-picks are dropped, so the device is macOS-only again
+(`#[cfg(target_os = "macos")]` in `src/devices/src/virtio/vsock/mod.rs`) and a
+Linux guest's clock is not synchronised through it. This branch's own release
+build no longer passes `TIMESYNC=1` either, and cang builds its guest init
+without the `timesync` feature, so the clock worker never starts. The intended
+replacement is a virtio RTC device (`vhost-device-rtc`) rather than the vsock
+timesync channel.
 
 PR 865 (virtio/blk parallel reads with an auto-sized, overridable I/O pool,
 `krun_block_device_set_pool_size` once PR 960's rename is on top) is merged
@@ -142,6 +153,13 @@ no longer exist upstream. The C names are regenerated from the Rust API by
   workload's opcode mix can be measured; it is what every request-removing lever
   has to be priced against. Default off, one relaxed atomic increment when on.
 
+The host huge-page advice the branch used to carry (`madvise(MADV_HUGEPAGE)` on
+every guest memory region, unconditionally) is **not** carried either: upstream
+does the same advice behind `krun_vmm_builder_transparent_huge_pages()`
+(`abe0a0f6`), and cang asks for it at launch. Upstream's version is the better
+knob - a caller that does not ask gets no advice - and keeping both would have
+meant advising twice and defeating the caller's choice.
+
 The vaapi video work the branch used to carry (DRM render-node opened `O_RDWR`,
 `get_drm_fd` renderer callback) is **not** re-added: crates.io `rutabaga_gfx`
 0.1.85 already ships it (`src/virgl_renderer.rs` opens the render node
@@ -158,7 +176,7 @@ ABI 2 gates the whole C surface behind the `ffi` cargo feature, and the Makefile
 only enables it for `FFI=1`. Build with:
 
 ```
-make BLK=1 NET=1 GPU=1 INPUT=1 TIMESYNC=1 FFI=1
+make BLK=1 NET=1 GPU=1 INPUT=1 FFI=1
 ```
 
 `make install` then produces `libkrun.so.2*` (the VMM + the fork's extensions)

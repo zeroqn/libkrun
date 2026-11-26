@@ -358,6 +358,97 @@ typedef KrunResult (*krun_fs_device_set_cache_policy_fn)(KrunFsDevice handle, ui
  */
 KrunResult krun_fs_device_set_cache_timeouts(KrunFsDevice handle, uint32_t entry_timeout_ms, uint32_t attr_timeout_ms, KrunError* err_out);
 typedef KrunResult (*krun_fs_device_set_cache_timeouts_fn)(KrunFsDevice handle, uint32_t entry_timeout_ms, uint32_t attr_timeout_ms, KrunError* err_out);
+/**
+ * Set how many threads serve the virtiofs request queue.
+ *
+ * virtio-fs has no multiqueue feature: the guest driver maps a single
+ * request queue however many vCPUs it has, so using more than one host core
+ * means serving that queue's descriptors from a pool (as upstream
+ * virtiofsd's `process_queue_pool` does). The device thread keeps reading
+ * the available ring and publishing used-ring entries; the pool threads do
+ * the FUSE work and write the replies. Replies complete out of order, which
+ * the FUSE protocol allows: the client matches a reply to its request by
+ * the header's `unique` field.
+ *
+ * Worth raising for workloads that scan large directories - one READDIRPLUS
+ * thread is enough to saturate a single server thread - and close to free
+ * for the small-file classes. `1` disables the pool and keeps every request
+ * on the device thread; the value is clamped to the host's available
+ * parallelism.
+ */
+void krun_fs_device_set_worker_threads(KrunFsDevice handle, size_t threads);
+typedef void (*krun_fs_device_set_worker_threads_fn)(KrunFsDevice handle, size_t threads);
+/**
+ * Serve `FUSE_OPEN`/`FUSE_OPENDIR` with `-ENOSYS`, acknowledging
+ * `FUSE_NO_OPEN_SUPPORT`/`FUSE_NO_OPENDIR_SUPPORT` (a "zero-message open").
+ *
+ * The client then stops sending those requests altogether and completes the
+ * matching releases itself, which removes two round trips from every file
+ * and every directory open. It matters because a FUSE round trip costs the
+ * same per request whatever the opcode, so the only large lever is issuing
+ * fewer of them. What the handle used to identify is served from a
+ * descriptor the server opens and caches per *inode* on first use, so the
+ * descriptor lifetime moves from the open to the inode.
+ *
+ * Two things move with it: `FUSE_ATOMIC_O_TRUNC` stops being negotiated (no
+ * `FUSE_OPEN` to carry `O_TRUNC`, so the VFS truncates through `SETATTR`),
+ * and `FUSE_CREATE` answers without a handle (the kernel releases such a
+ * handle locally too, so one returned here would never be released).
+ */
+void krun_fs_device_set_zero_message_open(KrunFsDevice handle, bool enabled);
+typedef void (*krun_fs_device_set_zero_message_open_fn)(KrunFsDevice handle, bool enabled);
+/**
+ * Answer `FUSE_FLUSH` with `-ENOSYS`, i.e. tell the client the server has no
+ * close-time work so it stops sending the request.
+ *
+ * Worth one round trip per close - 21% of the requests a cold `cargo build`
+ * issues - because the server's flush body is a `dup()`+`close()` of the
+ * passthrough descriptor and nothing else. What is given up is the close's
+ * ability to report a *deferred* host error; no lock state is lost, because
+ * this server negotiates neither `POSIX_LOCKS` nor `FLOCK_LOCKS`, so the
+ * client's locks live in its own kernel and `filp_flush` releases them
+ * regardless of what `->flush` does.
+ */
+void krun_fs_device_set_no_flush(KrunFsDevice handle, bool enabled);
+typedef void (*krun_fs_device_set_no_flush_fn)(KrunFsDevice handle, bool enabled);
+/**
+ * Answer a lookup of a missing name with a cacheable negative entry
+ * (`nodeid == 0` plus `entry_valid`) instead of `-ENOENT`, and let the
+ * client cache it for `timeout_millis`. `enabled = false` keeps `-ENOENT`.
+ *
+ * `-ENOENT` is not cacheable, so every repeated probe of the same missing
+ * name costs a round trip; a build spends most of its lookups that way (91%
+ * of them in a cold `cargo build`, where caching them removed 72% of the
+ * requests and 21% of the wall time). The price is exactly the timeout: a
+ * file the *host* creates stays invisible to the client for up to that long,
+ * which is why it is short - a quarter second keeps 92% of the saving,
+ * because a compiler re-probes the same name within milliseconds.
+ */
+void krun_fs_device_set_negative_entry(KrunFsDevice handle, bool enabled, uint64_t timeout_millis);
+typedef void (*krun_fs_device_set_negative_entry_fn)(KrunFsDevice handle, bool enabled, uint64_t timeout_millis);
+/**
+ * Advertise `FUSE_CACHE_SYMLINKS`, so the client caches a symlink's target
+ * in the inode and stops sending a `READLINK` on every resolution of that
+ * path.
+ *
+ * Repeated resolutions of the same symlink were 35-57% of the requests of a
+ * spawn-heavy guest workload, and advertising the flag removed 98-99% of
+ * them. The cost is the target's freshness for `entry_timeout` (5 s by
+ * default), which is the same window zero-message opens already expose file
+ * contents to; a target that never changes costs nothing.
+ */
+void krun_fs_device_set_cache_symlinks(KrunFsDevice handle, bool enabled);
+typedef void (*krun_fs_device_set_cache_symlinks_fn)(KrunFsDevice handle, bool enabled);
+/**
+ * Report the opcode mix the device served when it stops.
+ *
+ * The guest kernel cannot trace fuse requests, so a histogram counted here
+ * is the only way to price a request-removing change against a real
+ * workload. One relaxed increment per request; one block of log lines at
+ * teardown.
+ */
+void krun_fs_device_set_opcode_stats(KrunFsDevice handle, bool enabled);
+typedef void (*krun_fs_device_set_opcode_stats_fn)(KrunFsDevice handle, bool enabled);
 void krun_fs_device_destroy(KrunFsDevice handle);
 typedef void (*krun_fs_device_destroy_fn)(KrunFsDevice handle);
 #endif
@@ -901,6 +992,7 @@ KrunResult krun_gpu_device_set_render_server_fd(KrunGpuDevice* handle, int rende
 typedef KrunResult (*krun_gpu_device_set_render_server_fd_fn)(KrunGpuDevice* handle, int render_server_fd, KrunError* err_out);
 void krun_gpu_device_shm_size(KrunGpuDevice* handle, size_t size);
 typedef void (*krun_gpu_device_shm_size_fn)(KrunGpuDevice* handle, size_t size);
+#if (defined(__linux__) && !defined(__ANDROID__))
 /**
  * Ask for the zero-copy SHM fast path (cang's `--zero-copy-shm`).
  *
@@ -914,6 +1006,7 @@ typedef void (*krun_gpu_device_shm_size_fn)(KrunGpuDevice* handle, size_t size);
  */
 void krun_gpu_device_set_zero_copy_shm(KrunGpuDevice* handle, bool enable);
 typedef void (*krun_gpu_device_set_zero_copy_shm_fn)(KrunGpuDevice* handle, bool enable);
+#endif
 void krun_gpu_device_destroy(KrunGpuDevice handle);
 typedef void (*krun_gpu_device_destroy_fn)(KrunGpuDevice handle);
 

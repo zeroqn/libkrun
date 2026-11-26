@@ -60,7 +60,7 @@ jobs:
           # ABI 2 puts the C entry points behind the `ffi` cargo feature: without
           # FFI=1 the host library exports no `krun_*` symbol at all and the
           # asset is unusable by any C consumer (the init blob always gets ffi).
-          make BLK=1 NET=1 GPU=1 INPUT=1 TIMESYNC=1 FFI=1
+          make BLK=1 NET=1 GPU=1 INPUT=1 FFI=1
           # Upstream derives LIBDIR_Linux from /etc/debian_version (493d707f),
           # so on the Ubuntu runners `make install` writes tmp/usr/lib/<arch>-linux-gnu
           # while this step packages lib64. A command-line assignment overrides
@@ -89,7 +89,7 @@ jobs:
             nm -D --defined-only pkgroot/lib64/libkrun.so.2 | grep -q " T ${symbol}$" \
               || { echo "error: libkrun.so.2 does not export ${symbol}" >&2; exit 1; }
           done
-          for symbol in krun_init_config_builder krun_init_config_apply_in; do
+          for symbol in krun_init_config_builder krun_init_config_apply; do
             nm -D --defined-only pkgroot/lib64/libkrun_init.so.0 | grep -q " T ${symbol}$" \
               || { echo "error: libkrun_init.so.0 does not export ${symbol}" >&2; exit 1; }
           done
